@@ -725,7 +725,9 @@
   ========================================================== */
   function renderTopbar(){
     return '<div class="topbar">'+
-      '<div class="brand-mini"><img src="'+LOGO_ICON_DATA_URI+'" class="topbar-logo" alt="logo" /> '+CLIENT_NAME+' Flex Benefits Portal</div>'+
+      '<div class="brand-mini"><img src="'+LOGO_ICON_DATA_URI+'" class="topbar-logo" alt="logo" />'+
+        '<div class="brand-text"><div class="brand-title">Flex Benefits Portal</div><div class="brand-client">'+escapeHtml(CLIENT_NAME)+'</div></div>'+
+      '</div>'+
       '<div class="topbar-right"><span class="user-chip">'+escapeHtml(STATE.profile.name)+' <span class="role-tag">'+STATE.profile.role+'</span></span>'+
       '<button class="btn btn-ghost btn-sm" data-action="logout">Log out</button></div>'+
     '</div>';
