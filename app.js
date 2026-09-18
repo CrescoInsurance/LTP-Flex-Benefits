@@ -33,8 +33,10 @@
     session: null,
     profile: null,
     activeTab: null,
-    profiles: [], benefits: [], rejectReasons: [], claims: [], notifications: [], invites: [],
+    profiles: [], benefits: [], rejectReasons: [], claims: [], notifications: [], invites: [], familyMembers: [],
     toast: null, modal: null,
+    confirmDeleteFamilyId: null,
+    familyEmployeeFilter: null,
     rejectingClaimId: null,
     editingClaimId: null,
     confirmDeleteClaimId: null,
@@ -527,6 +529,7 @@
       calls.push(supabase.from('profiles').select('*').order('name'));
       calls.push(supabase.from('invites').select('*').order('created_at', {ascending:false}));
       calls.push(supabase.from('app_settings').select('*'));
+      calls.push(supabase.from('family_members').select('*').order('name'));
     }
     return Promise.all(calls).then(function(results){
       STATE.benefits = (results[0].data||[]).map(function(b){ return b.name; });
@@ -538,9 +541,11 @@
         STATE.invites = results[5].data || [];
         STATE.appSettings = {};
         (results[6].data||[]).forEach(function(s){ STATE.appSettings[s.key] = s.value; });
+        STATE.familyMembers = results[7].data || [];
       } else {
         STATE.profiles = STATE.profile ? [STATE.profile] : [];
         STATE.invites = [];
+        STATE.familyMembers = [];
       }
     });
   }
@@ -937,6 +942,7 @@
         navTab('approvals','Pending Approvals'+(pendingCount?' <span class="badge">'+pendingCount+'</span>':''))+
         navTab('all','All Submissions')+
         navTab('staff','Employee Management')+
+        navTab('family','Family Members')+
         navTab('benefits','Benefit Categories')+
         navTab('access','User Access')+
         navTab('finance','Finance')+
@@ -945,6 +951,7 @@
       '<div class="content">'+
         (tab==='all' ? renderAdminAllSubmissions() :
          tab==='staff' ? renderAdminStaff() :
+         tab==='family' ? renderAdminFamily() :
          tab==='benefits' ? renderAdminBenefits() :
          tab==='access' ? renderAdminAccess() :
          tab==='finance' ? renderAdminFinance() :
@@ -986,7 +993,7 @@
           '<button class="btn btn-sm btn-danger" data-action="delete-profile" data-id="'+p.id+'">Delete</button>';
       }
       var roleLabel = p.role==='admin' ? 'Admin' : 'User';
-      return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td>'+
+      return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td><td>'+escapeHtml(p.nric||'-')+'</td>'+
         '<td><span class="role-chip">'+roleLabel+'</span></td>'+
         '<td>'+allocCell+'</td>'+
         '<td>'+fmtDate(p.date_of_joining)+'</td>'+
@@ -1024,13 +1031,14 @@
         '<label class="mini-field">Date of Employment<input type="date" name="dateOfEmployment" style="width:160px" required /></label>'+
         '<label class="mini-field">Effective Date<input type="date" name="effectiveDate" style="width:160px" required /></label>'+
         '<label class="mini-field">PayNow Mobile Number<input type="tel" name="paynowMobile" placeholder="e.g. 91234567" style="width:160px" required /></label>'+
+        '<label class="mini-field">NRIC<input type="text" name="nric" placeholder="e.g. S1234567A" style="width:140px" /></label>'+
         '<label class="mini-field">Entitlement (SGD)<input type="number" name="annualAllocation" value="1000" min="0" step="1" style="width:140px" required /></label>'+
         '<button type="submit" class="btn btn-primary">Add Employee</button>'+
       '</form>'+
       '<div class="field-hint">New employees are invited as Users. To grant Admin access, use the User Access tab after they\'ve signed up. A welcome email with sign-up instructions is sent automatically once the Effective Date arrives.</div>'+
     '</div>'+
     '<div class="card"><div class="card-title">Bulk Invite (CSV)</div>'+
-      '<div class="muted small" style="margin-bottom:10px;">Columns: name,email,annualAllocation,dateOfEmployment,paynowMobile,effectiveDate. First row is treated as a header and skipped. The last three columns are optional.</div>'+
+      '<div class="muted small" style="margin-bottom:10px;">Columns: name,email,annualAllocation,dateOfEmployment,paynowMobile,effectiveDate,nric. First row is treated as a header and skipped. The last four columns are optional.</div>'+
       '<div class="dropzone" id="staff-csv-dropzone">'+
         '<input type="file" id="staff-csv-input" accept=".csv" />'+
         '<div class="dropzone-hint">Choose a file, or drag and drop it here</div>'+
@@ -1042,9 +1050,69 @@
     '<div class="card"><div class="card-title">Employee Directory</div>'+
       '<div class="filter-row">'+staffFilters.map(function(f){ return '<button class="chip-filter '+(roleFilter===f.key?'active':'')+'" data-action="filter-staff" data-filter="'+f.key+'">'+f.label+'</button>'; }).join('')+'</div>'+
       '<div class="table-wrap"><table class="data-table">'+
-      '<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Annual Allocation</th><th>Date of Employment</th><th>Effective Date</th><th>Date of Termination</th><th>Status</th><th>Actions</th></tr></thead>'+
+      '<thead><tr><th>Name</th><th>Email</th><th>NRIC</th><th>Role</th><th>Annual Allocation</th><th>Date of Employment</th><th>Effective Date</th><th>Date of Termination</th><th>Status</th><th>Actions</th></tr></thead>'+
       '<tbody>'+staffRows+'</tbody></table></div>'+
       '<div class="field-hint">Deleting an employee removes their account, all their claim history, and their notifications - permanently, and this cannot be undone. Their login itself still technically exists in Supabase until removed from the dashboard\'s Authentication &gt; Users page too, but they won\'t be able to do anything with it here once deleted.</div>'+
+    '</div>';
+  }
+
+  function renderAdminFamily(){
+    var employees = STATE.profiles.slice().sort(function(a,b){ return a.name.localeCompare(b.name); });
+    var filterEmail = STATE.familyEmployeeFilter || '';
+    var employeeFilterOptions = '<option value="">All Employees</option>'+employees.map(function(p){
+      return '<option value="'+escapeHtml(p.email)+'" '+(filterEmail===p.email?'selected':'')+'>'+escapeHtml(p.name)+'</option>';
+    }).join('');
+    var addEmployeeOptions = employees.map(function(p){
+      return '<option value="'+escapeHtml(p.email)+'">'+escapeHtml(p.name)+' ('+escapeHtml(p.email)+')</option>';
+    }).join('');
+    function employeeNameByEmail(email){
+      var p = employees.filter(function(x){ return x.email===email; })[0];
+      return p ? p.name : email;
+    }
+    var members = STATE.familyMembers.slice();
+    if(filterEmail){ members = members.filter(function(m){ return m.employee_email===filterEmail; }); }
+    members.sort(function(a,b){
+      var an = employeeNameByEmail(a.employee_email), bn = employeeNameByEmail(b.employee_email);
+      if(an!==bn) return an.localeCompare(bn);
+      return a.name.localeCompare(b.name);
+    });
+    var relationshipOptions = ['Spouse','Child','Parent','Other'].map(function(r){ return '<option value="'+r+'">'+r+'</option>'; }).join('');
+    var rows = members.map(function(m){
+      var actionsCell = STATE.confirmDeleteFamilyId===m.id
+        ? '<button class="btn btn-sm btn-danger" data-action="delete-family-confirm" data-id="'+m.id+'">Confirm?</button> <button class="btn btn-sm btn-ghost" data-action="delete-family-cancel">Cancel</button>'
+        : '<button class="btn btn-sm btn-danger" data-action="delete-family" data-id="'+m.id+'">Remove</button>';
+      return '<tr><td>'+escapeHtml(employeeNameByEmail(m.employee_email))+'</td>'+
+        '<td>'+escapeHtml(m.name)+'</td>'+
+        '<td>'+escapeHtml(m.relationship)+'</td>'+
+        '<td>'+fmtDate(m.date_of_birth)+'</td>'+
+        '<td>'+escapeHtml(m.nric||'-')+'</td>'+
+        '<td class="actions-cell">'+actionsCell+'</td></tr>';
+    }).join('');
+    return ''+
+    '<div class="card"><div class="card-title">Add Family Member</div>'+
+      (employees.length ? (
+      '<form data-form="add-family" class="inline-form">'+
+        '<label class="mini-field">Employee<select name="employeeEmail" required><option value="">Select employee...</option>'+addEmployeeOptions+'</select></label>'+
+        '<label class="mini-field">Full Name<input type="text" name="name" placeholder="e.g. Mary Lim" required /></label>'+
+        '<label class="mini-field">Relationship<select name="relationship" required><option value="">Select...</option>'+relationshipOptions+'</select></label>'+
+        '<label class="mini-field">Date of Birth<input type="date" name="dateOfBirth" style="width:160px" required /></label>'+
+        '<label class="mini-field">NRIC<input type="text" name="nric" placeholder="e.g. T0123456A" style="width:140px" /></label>'+
+        '<button type="submit" class="btn btn-primary">Add Family Member</button>'+
+      '</form>'
+      ) : '<div class="field-hint">Add an employee first in Employee Management before recording their family members.</div>')+
+    '</div>'+
+    '<div class="card"><div class="card-title">Bulk Add Family Members (CSV)</div>'+
+      '<div class="muted small" style="margin-bottom:10px;">Columns: employeeEmail,name,relationship,dateOfBirth,nric. First row is treated as a header and skipped. employeeEmail must match an existing employee\'s email. nric is optional. relationship should be Spouse, Child, Parent or Other.</div>'+
+      '<div class="dropzone" id="family-csv-dropzone">'+
+        '<input type="file" id="family-csv-input" accept=".csv" />'+
+        '<div class="dropzone-hint">Choose a file, or drag and drop it here</div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="card"><div class="card-title">Family Members</div>'+
+      '<label class="mini-field" style="display:block;max-width:280px;margin-bottom:12px;">Filter by Employee<select data-action="filter-family-employee">'+employeeFilterOptions+'</select></label>'+
+      '<div class="table-wrap"><table class="data-table">'+
+      '<thead><tr><th>Employee</th><th>Name</th><th>Relationship</th><th>Date of Birth</th><th>NRIC</th><th>Actions</th></tr></thead>'+
+      '<tbody>'+(rows || '<tr><td colspan="6" class="muted">No family members recorded yet.</td></tr>')+'</tbody></table></div>'+
     '</div>';
   }
 
@@ -1973,6 +2041,7 @@
     var dateOfEmployment = form.dateOfEmployment.value;
     var effectiveDate = form.effectiveDate.value;
     var paynowMobile = form.paynowMobile.value.trim();
+    var nric = form.nric.value.trim();
     var allocRaw = form.annualAllocation.value;
     var alloc = parseFloat(allocRaw);
     if(!name || !email || !dateOfEmployment || !effectiveDate || !paynowMobile || allocRaw==='' || isNaN(alloc)){
@@ -1980,7 +2049,7 @@
       return Promise.resolve();
     }
     return supabase.from('invites').upsert(
-      {email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfEmployment, paynow_mobile:paynowMobile, effective_date:effectiveDate, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false},
+      {email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfEmployment, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric: nric || null, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false},
       {onConflict:'email'}
     ).then(function(res){
       if(res.error){ showToast('Could not add employee: '+res.error.message, 'error'); return; }
@@ -2003,8 +2072,9 @@
         var dateOfJoining = parts[3] && parts[3].length ? parts[3] : null;
         var paynowMobile = parts[4] && parts[4].length ? parts[4] : null;
         var effectiveDate = parts[5] && parts[5].length ? parts[5] : null;
+        var nric = parts[6] && parts[6].length ? parts[6] : null;
         if(!name || !email) continue;
-        rows.push({email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfJoining, paynow_mobile:paynowMobile, effective_date:effectiveDate, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false});
+        rows.push({email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfJoining, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric:nric, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false});
       }
       if(!rows.length){ showToast('No valid rows found in that CSV.', 'error'); return; }
       return supabase.from('invites').upsert(rows, {onConflict:'email'}).then(function(res){
@@ -2015,11 +2085,69 @@
     }).then(function(){ render(); }).catch(function(){ showToast('Could not read that CSV file.', 'error'); });
   }
 
+  function handleFamilyCsv(file){
+    if(!file) return Promise.resolve();
+    var knownEmails = {};
+    STATE.profiles.forEach(function(p){ knownEmails[(p.email||'').toLowerCase()] = true; });
+    return file.text().then(function(text){
+      var lines = text.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(Boolean);
+      if(lines.length<2){ showToast('CSV appears to be empty.', 'error'); return; }
+      var rows = [];
+      var skipped = 0;
+      for(var i=1;i<lines.length;i++){
+        var parts = lines[i].split(',').map(function(p){ return p.trim(); });
+        if(parts.length<4){ skipped++; continue; }
+        var employeeEmail = (parts[0]||'').toLowerCase();
+        var name = parts[1];
+        var relationship = parts[2];
+        var dateOfBirth = parts[3] && parts[3].length ? parts[3] : null;
+        var nric = parts[4] && parts[4].length ? parts[4] : null;
+        if(!employeeEmail || !name || !relationship || !dateOfBirth || !knownEmails[employeeEmail]){ skipped++; continue; }
+        rows.push({employee_email:employeeEmail, name:name, relationship:relationship, date_of_birth:dateOfBirth, nric:nric});
+      }
+      if(!rows.length){ showToast('No valid rows found in that CSV. Check that each employeeEmail matches an existing employee.', 'error'); return; }
+      return supabase.from('family_members').insert(rows).then(function(res){
+        if(res.error){ showToast('Bulk family add failed: '+res.error.message, 'error'); return; }
+        showToast(rows.length+' family member(s) added.'+(skipped?(' '+skipped+' row(s) skipped.'):''), 'success');
+        return loadAppData();
+      });
+    }).then(function(){ render(); }).catch(function(){ showToast('Could not read that CSV file.', 'error'); });
+  }
+
   function revokeInviteConfirmed(email){
     STATE.confirmRevokeInvite = null;
     return supabase.from('invites').delete().eq('email', email).then(function(res){
       if(res.error){ showToast('Could not revoke invite: '+res.error.message, 'error'); return; }
       showToast('Invite revoked.', 'success');
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
+  function addFamilyMember(form){
+    var employeeEmail = form.employeeEmail.value;
+    var name = form.name.value.trim();
+    var relationship = form.relationship.value;
+    var dateOfBirth = form.dateOfBirth.value;
+    var nric = form.nric.value.trim();
+    if(!employeeEmail || !name || !relationship || !dateOfBirth){
+      showToast('Please complete all required fields before adding the family member.', 'error');
+      return Promise.resolve();
+    }
+    return supabase.from('family_members').insert(
+      {employee_email:employeeEmail, name:name, relationship:relationship, date_of_birth:dateOfBirth, nric: nric || null}
+    ).then(function(res){
+      if(res.error){ showToast('Could not add family member: '+res.error.message, 'error'); return; }
+      showToast(name+' added.', 'success');
+      form.reset();
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
+  function deleteFamilyMemberConfirmed(id){
+    STATE.confirmDeleteFamilyId = null;
+    return supabase.from('family_members').delete().eq('id', id).then(function(res){
+      if(res.error){ showToast('Could not remove family member: '+res.error.message, 'error'); return; }
+      showToast('Family member removed.', 'success');
       return loadAppData();
     }).then(function(){ render(); });
   }
@@ -2175,6 +2303,9 @@
       case 'delete-profile-confirm': return deletePermanently(id);
       case 'revoke-invite': STATE.confirmRevokeInvite=btn.dataset.email; render(); return Promise.resolve();
       case 'revoke-invite-cancel': STATE.confirmRevokeInvite=null; render(); return Promise.resolve();
+      case 'delete-family': STATE.confirmDeleteFamilyId=id; render(); return Promise.resolve();
+      case 'delete-family-cancel': STATE.confirmDeleteFamilyId=null; render(); return Promise.resolve();
+      case 'delete-family-confirm': return deleteFamilyMemberConfirmed(id);
       case 'sort-report-emp': {
         var col = btn.dataset.column;
         if(STATE.reportSortColumn===col){ STATE.reportSortDirection = STATE.reportSortDirection==='desc'?'asc':'desc'; }
@@ -2211,6 +2342,7 @@
     if(type==='signup') return doSignup(form);
     if(type==='submit-claim') return submitClaim(form);
     if(type==='invite-staff') return inviteStaff(form);
+    if(type==='add-family') return addFamilyMember(form);
     if(type==='add-benefit') return addBenefit(form);
     return Promise.resolve();
   }
@@ -2228,6 +2360,10 @@
       var f = target.files[0]; target.value='';
       return handleStaffCsv(f);
     }
+    if(target.id==='family-csv-input'){
+      var ff = target.files[0]; target.value='';
+      return handleFamilyCsv(ff);
+    }
     if(target.id==='claim-currency-input' || (target.id && target.id.indexOf('edit-currency-')===0)){
       handleAmountRelatedChange(target);
       return Promise.resolve();
@@ -2240,6 +2376,7 @@
       case 'set-report-month': STATE.reportMonth = parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-report-year': STATE.reportYear = (target.value==='ytd') ? 'ytd' : parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-invoice-year': STATE.invoiceYear = parseInt(target.value,10); render(); return Promise.resolve();
+      case 'filter-family-employee': STATE.familyEmployeeFilter = target.value || null; render(); return Promise.resolve();
       default: return Promise.resolve();
     }
   }
