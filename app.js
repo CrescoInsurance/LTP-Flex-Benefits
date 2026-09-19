@@ -614,12 +614,14 @@
     return items;
   }
 
-  // "Money Holding" / 80% cash-cushion check for New Hire Invoicing --------
+  // "Money Holding" / 80% utilisation check for New Hire Invoicing --------
   // The client doesn't need to be re-invoiced the instant a mid-year new
-  // hire or promotion happens, as long as the cash LTP is already holding
-  // on their behalf comfortably covers the company's current total planned
-  // entitlement commitment. This is purely a reminder threshold - it never
-  // blocks issuing an invoice manually at any time.
+  // hire or promotion happens - only once the cash LTP is already holding
+  // on their behalf has been drawn down to the point where 80% or more of
+  // the company's total planned entitlement commitment has been utilised
+  // (i.e. Money Holding has fallen to 20% or less of that planned total).
+  // This is purely a reminder threshold - it never blocks issuing an
+  // invoice manually at any time, at any utilisation level.
 
   // annual_allocation is a live figure: saveAlloc()/confirmPromotion() write
   // it onto the profile the instant a new hire is added or a promotion is
@@ -658,13 +660,18 @@
   function entitlementCushionStatus(){
     var holding = moneyHoldingBalance();
     var planned = totalPlannedEntitlement();
-    var ratio = planned>0 ? holding/planned : 1;
+    // Utilisation: how much of the total planned entitlement has already
+    // been drawn down out of what LTP is holding for the client. 0% means
+    // the full planned amount is still sitting in the float; 100% would
+    // mean it's completely exhausted. Clamped to 0 so a holding balance
+    // that's actually ahead of the plan never shows as negative utilisation.
+    var utilisation = planned>0 ? Math.max(0, (planned-holding)/planned) : 0;
     var pendingCount = pendingEntitlementItems().length;
-    var belowThreshold = planned>0 && ratio<0.8;
+    var belowThreshold = planned>0 && utilisation>=0.8;
     return {
-      holding:holding, planned:planned, ratio:ratio, belowThreshold:belowThreshold,
-      // 0 whenever there's nothing to invoice, even if the cushion is thin -
-      // the reminder is about the backlog below, not the ratio alone.
+      holding:holding, planned:planned, utilisation:utilisation, belowThreshold:belowThreshold,
+      // 0 whenever there's nothing to invoice, even at 80%+ utilisation -
+      // the reminder is about the backlog below, not the utilisation alone.
       reminderCount: (belowThreshold && pendingCount) ? pendingCount : 0
     };
   }
@@ -1577,10 +1584,10 @@
   ========================================================== */
   function renderAdminShell(){
     var pendingCount = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
-    // The Finance tab badge only nags once the cash cushion actually needs
-    // topping up (entitlementCushionStatus().reminderCount) - not merely
-    // whenever something is technically un-invoiced, which is normal and
-    // fine as long as the float holds.
+    // The Finance tab badge only nags once utilisation has actually hit 80%
+    // (entitlementCushionStatus().reminderCount) - not merely whenever
+    // something is technically un-invoiced, which is normal and fine as
+    // long as the float hasn't run down that far.
     var financeReminderCount = entitlementCushionStatus().reminderCount;
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
@@ -2029,17 +2036,17 @@
   // never a black box - the admin sees the exact numbers it came from.
   function renderEntitlementCushionPanel(){
     var c = entitlementCushionStatus();
-    var pctLabel = c.planned>0 ? Math.round(c.ratio*100)+'%' : '&mdash;';
+    var pctLabel = c.planned>0 ? Math.round(c.utilisation*100)+'%' : '&mdash;';
     var statusLine = c.planned<=0
       ? 'No active employees yet - nothing to fund.'
       : c.belowThreshold
-        ? ('Cushion below 80% - '+c.reminderCount+' item'+(c.reminderCount===1?'':'s')+' below (new hires and/or promotions) should be batched into an invoice to top up the float.')
-        : 'Cushion healthy (80% or above) - any new hires or promotions below can wait; no invoicing required yet.';
+        ? ('80% or more of the total entitlement has been utilised - '+c.reminderCount+' item'+(c.reminderCount===1?'':'s')+' below (new hires and/or promotions) should be batched into an invoice to top up the float.')
+        : 'Utilisation is under 80% - any new hires or promotions below can wait; no invoicing required yet.';
     var statusColor = (c.planned>0 && c.belowThreshold) ? 'var(--danger)' : 'var(--success)';
     return '<div class="report-summary" style="margin-bottom:8px;">'+
         'Money Holding: <strong>'+fmtMoney(c.holding)+'</strong> &middot; '+
         'Total Planned Entitlement: <strong>'+fmtMoney(c.planned)+'</strong> &middot; '+
-        'Cushion: <strong>'+pctLabel+'</strong>'+
+        'Utilisation: <strong>'+pctLabel+'</strong>'+
       '</div>'+
       '<div class="field-hint" style="margin-bottom:14px; color:'+statusColor+';">'+statusLine+'</div>';
   }
