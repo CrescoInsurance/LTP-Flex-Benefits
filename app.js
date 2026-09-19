@@ -68,8 +68,20 @@
     invoiceYear: null,
     editingInvoiceRate: false,
     editingClientName: false,
+    editingWaiverLine: null, // 'headcountAdjustment' | 'baseHeadcountCharge' | null
     appSettings: {},
-    _realtimeSubscribed: false
+    _realtimeSubscribed: false,
+    // Entitlement invoicing (New Hire / Promotion / Initial Roster invoices)
+    allocationChanges: [], entitlementInvoices: [], entitlementInvoiceItems: [], annualInvoices: [],
+    entitlementSelections: {}, // key -> {checked, prorate, waiveStatus:'normal'|'waived'|'custom', waiveReason, overrideAmount}
+    entitlementDateFrom: null, entitlementDateTo: null,
+    entitlementPreviewOpen: false,
+    promotingEmployeeId: null, // set while the "give this allocation change an effective date" prompt is open
+    promotionDraftAllocation: null, promotionDraftDate: null,
+    voidingInvoice: null, // {type:'entitlement'|'annual', id}
+    voidReasonDraft: '',
+    annualPreviewOpen: false,
+    annualWaivers: {} // {headcountAdjustment:{status,reason,amount}, baseHeadcountCharge:{status,reason,amount}}
   };
 
   /* =========================================================
@@ -344,23 +356,20 @@
     return s;
   }
 
-  // Returns the invoice number for a given benefit year, assigning and
-  // persisting a new one (from a per-client running counter) the first time
-  // that year's invoice is exported. Re-exporting the same year always
-  // returns the same stored number rather than incrementing again.
-  function ensureInvoiceNumber(year){
-    var key = 'invoice_number_'+year;
-    var existing = STATE.appSettings && STATE.appSettings[key];
-    if(existing){ return Promise.resolve(existing); }
+  // Draws the next invoice number off one shared running counter, used by
+  // BOTH the Annual Invoice and every entitlement invoice (New Hire /
+  // Promotion / Initial Roster), so numbers interleave in the order
+  // invoices are actually issued, all in the same INV-<CLIENTCODE>-#### format.
+  // Only ever called from an explicit "Issue" action, never from Preview -
+  // previewing an invoice must never consume a real number.
+  function nextInvoiceNumber(){
     var nextSeq = parseInt(STATE.appSettings && STATE.appSettings.invoice_sequence_next, 10);
     if(isNaN(nextSeq) || nextSeq<1){ nextSeq = 1; }
     var formatted = 'INV-'+getClientCode()+'-'+padInvoiceSeq(nextSeq);
     return supabase.from('app_settings').upsert([
-      {key:key, value:formatted},
       {key:'invoice_sequence_next', value:String(nextSeq+1)}
     ], {onConflict:'key'}).then(function(res){
       if(res.error){ showToast('Could not assign invoice number: '+res.error.message, 'error'); throw res.error; }
-      STATE.appSettings[key] = formatted;
       STATE.appSettings.invoice_sequence_next = String(nextSeq+1);
       return formatted;
     });
@@ -374,6 +383,252 @@
     STATE.profiles.forEach(function(p){ if(p.effective_date){ years[parseInt(p.effective_date.slice(0,4),10)]=true; } });
     STATE.claims.forEach(function(c){ if(c.receipt_date){ years[parseInt(c.receipt_date.slice(0,4),10)]=true; } });
     return Object.keys(years).map(Number).sort(function(a,b){ return b-a; });
+  }
+
+  // How many of the 12 months of `year` an employee counts as employed, for
+  // the purpose of billing the company. Both ends are prorated by whole
+  // calendar months (any day in a month counts as that full month):
+  // - New joiners: counted from their effective_date's month (e.g. joining
+  //   anytime in July counts as 6 months, Jul-Dec) through December, unless
+  //   they also terminate within the same year (see below).
+  // - Terminations: counted through their date_of_termination's month (e.g.
+  //   leaving anytime in March counts as 3 months, Jan-Mar), starting from
+  //   January unless they also joined within the same year.
+  // Anyone who joined before this year and has no termination this year (or
+  // has neither date on file) counts as a full 12 months.
+  function monthsEmployedInYear(p, year){
+    var startMonth = 1;
+    if(p.effective_date){
+      var effYear = Number(p.effective_date.slice(0,4));
+      if(effYear === year){ startMonth = Number(p.effective_date.slice(5,7)); }
+      else if(effYear > year){ return 0; }
+    }
+    var endMonth = 12;
+    if(p.date_of_termination){
+      var termYear = Number(p.date_of_termination.slice(0,4));
+      if(termYear === year){ endMonth = Number(p.date_of_termination.slice(5,7)); }
+      else if(termYear < year){ return 0; }
+    }
+    return Math.max(0, endMonth - startMonth + 1);
+  }
+  function proratedAllocationForYear(p, year){
+    var annualAlloc = Number(p.annual_allocation)||0;
+    return annualAlloc * (monthsEmployedInYear(p, year)/12);
+  }
+
+  /* =========================================================
+     ENTITLEMENT INVOICING (New Hire / Promotion / Initial Roster)
+     ---------------------------------------------------------
+     A separate, ad-hoc invoice (issued whenever, not once a year) that
+     bills the client only for entitlement dollars - never the headcount
+     adjustment, which stays exclusively on the Annual Invoice. The very
+     first one ever issued for this client is automatically the "Initial
+     Invoice" (adds a per-pax headcount establishment charge on top);
+     every one after that is a plain New Hire / Promotion invoice
+     (entitlement only).
+  ========================================================== */
+
+  // How many of the remaining months of the year a mid-year promotion's
+  // allocation increase (or decrease) should be billed for, counting the
+  // effective-date month itself as a full month - same whole-month rule as
+  // a new joiner, just measured from the change date instead of a hire date.
+  function monthsFromDateToYearEnd(dateStr){
+    var month = Number(dateStr.slice(5,7));
+    return 12 - month + 1;
+  }
+
+  function hasAnyIssuedEntitlementInvoice(){
+    return STATE.entitlementInvoices.some(function(inv){ return inv.status==='issued'; });
+  }
+
+  // Every issued (non-voided) entitlement-invoice line item that actually
+  // billed an employee's base entitlement (new hire or initial-roster type),
+  // keyed by employee id + the calendar year it covered. Used both to keep
+  // an already-invoiced employee off the pending list, and by the Annual
+  // Invoice to know what was actually billed for them instead of guessing.
+  function issuedEntitlementItemsByEmployeeYear(){
+    var issuedInvoiceIds = {};
+    STATE.entitlementInvoices.forEach(function(inv){ if(inv.status==='issued'){ issuedInvoiceIds[inv.id]=inv; } });
+    var map = {};
+    STATE.entitlementInvoiceItems.forEach(function(item){
+      var inv = issuedInvoiceIds[item.invoice_id];
+      if(!inv) return;
+      if(item.item_type!=='new_hire' && item.item_type!=='initial_roster') return;
+      var yr = Number(item.effective_date.slice(0,4));
+      var key = item.employee_id+'|'+yr;
+      if(!map[key]) map[key] = [];
+      map[key].push({item:item, invoice:inv});
+    });
+    return map;
+  }
+
+  // Sum of already-issued promotion line items for an employee in a given
+  // year (an employee can have more than one promotion invoiced in a year).
+  function issuedPromotionAmountForEmployeeYear(employeeId, year){
+    var issuedInvoiceIds = {};
+    STATE.entitlementInvoices.forEach(function(inv){ if(inv.status==='issued'){ issuedInvoiceIds[inv.id]=true; } });
+    var total = 0;
+    STATE.entitlementInvoiceItems.forEach(function(item){
+      if(item.item_type!=='promotion') return;
+      if(!issuedInvoiceIds[item.invoice_id]) return;
+      if(item.employee_id!==employeeId) return;
+      if(Number(item.effective_date.slice(0,4))!==year) return;
+      total += Number(item.final_amount)||0;
+    });
+    return total;
+  }
+
+  function entitlementSelectionKey(kind, id){ return kind+':'+id; }
+
+  function getEntitlementSelection(key, defaultProrate){
+    if(!STATE.entitlementSelections[key]){
+      STATE.entitlementSelections[key] = {checked:false, prorate: defaultProrate!==false, waiveStatus:'normal', waiveReason:'', overrideAmount:null};
+    }
+    return STATE.entitlementSelections[key];
+  }
+
+  // The full pending list: employees never yet entitlement-invoiced (new
+  // hires), plus allocation increases/decreases awaiting invoicing
+  // (promotions). Nothing here is restricted to a single month - it's every
+  // outstanding billable event, in effective-date order, and the admin picks
+  // whichever subset to include on the next invoice.
+  function pendingEntitlementItems(){
+    if(!STATE.profiles || !STATE.profile || STATE.profile.role!=='admin') return [];
+    var billedMap = issuedEntitlementItemsByEmployeeYear();
+    var items = [];
+    STATE.profiles.forEach(function(p){
+      if(p.role!=='user' || !p.effective_date) return;
+      var year = Number(p.effective_date.slice(0,4));
+      if(billedMap[p.id+'|'+year]) return; // already invoiced for this year
+      var months = monthsEmployedInYear(p, year);
+      var prorated = proratedAllocationForYear(p, year);
+      var full = Number(p.annual_allocation)||0;
+      items.push({
+        key: entitlementSelectionKey('hire', p.id),
+        type: 'new_hire',
+        employeeId: p.id, employeeName: p.name, employeeEmail: p.email,
+        effectiveDate: p.effective_date, months: months,
+        proratedAmount: prorated, fullAmount: full,
+        defaultProrate: p.prorate_entitlement_default!==false
+      });
+    });
+    STATE.allocationChanges.forEach(function(ac){
+      if(ac.invoiced) return;
+      var delta = Number(ac.new_allocation)-Number(ac.old_allocation);
+      var months = monthsFromDateToYearEnd(ac.effective_date);
+      var prorated = delta*(months/12);
+      var p = profileById(ac.employee_id);
+      items.push({
+        key: entitlementSelectionKey('promo', ac.id),
+        type: 'promotion',
+        employeeId: ac.employee_id, employeeName: p?p.name:'(former employee)', employeeEmail: p?p.email:'',
+        effectiveDate: ac.effective_date, months: months,
+        proratedAmount: prorated, fullAmount: delta,
+        allocationChangeId: ac.id, oldAllocation: Number(ac.old_allocation), newAllocation: Number(ac.new_allocation)
+      });
+    });
+    items.sort(function(a,b){ return a.effectiveDate.localeCompare(b.effectiveDate); });
+    return items;
+  }
+
+  // Applies this item's Prorate checkbox and any Waive/Override choice to
+  // get the amount that will actually be billed.
+  function finalAmountForSelection(item, sel){
+    var base = sel.prorate ? item.proratedAmount : item.fullAmount;
+    if(sel.waiveStatus==='waived') return 0;
+    if(sel.waiveStatus==='custom' && sel.overrideAmount!=null && !isNaN(sel.overrideAmount)) return Number(sel.overrideAmount);
+    return base;
+  }
+
+  // Builds the live Preview: every currently-checked pending item, the
+  // per-pax establishment charge (only if this will be the client's very
+  // first entitlement invoice), and the totals. Nothing here is saved -
+  // Issue is the only action that writes anything.
+  function computeEntitlementInvoicePreview(){
+    var pending = pendingEntitlementItems();
+    var isInitial = !hasAnyIssuedEntitlementInvoice();
+    var rate = getInvoiceRate();
+    var lines = [];
+    var headcountForPax = 0;
+    pending.forEach(function(item){
+      var sel = getEntitlementSelection(item.key, item.defaultProrate);
+      if(!sel.checked) return;
+      var finalAmount = finalAmountForSelection(item, sel);
+      var usedProrate = sel.waiveStatus==='normal' ? sel.prorate : sel.prorate; // prorate flag still recorded even if waived/overridden
+      if(item.type==='new_hire' || item.type==='initial_roster') headcountForPax++;
+      lines.push({
+        item:item, selection:sel, finalAmount:finalAmount,
+        calculatedAmount: sel.prorate ? item.proratedAmount : item.fullAmount
+      });
+    });
+    var entitlementTotal = lines.reduce(function(s,l){ return s+l.finalAmount; }, 0);
+    var perPaxTotal = isInitial ? headcountForPax*rate : 0;
+    return {
+      invoiceType: isInitial ? 'initial' : 'new_hire',
+      lines: lines, rate: rate,
+      headcountForPax: headcountForPax, perPaxTotal: perPaxTotal,
+      entitlementTotal: entitlementTotal,
+      totalAmount: entitlementTotal + perPaxTotal
+    };
+  }
+
+  function issueEntitlementInvoice(){
+    var preview = computeEntitlementInvoicePreview();
+    if(!preview.lines.length){ showToast('Select at least one employee or promotion to invoice.', 'error'); return Promise.resolve(); }
+    return nextInvoiceNumber().then(function(invoiceNumber){
+      var header = {
+        invoice_number: invoiceNumber, invoice_type: preview.invoiceType, status:'issued',
+        issued_by: STATE.session.user.id, entitlement_total: preview.entitlementTotal,
+        per_pax_rate: preview.invoiceType==='initial' ? preview.rate : null,
+        per_pax_total: preview.perPaxTotal, total_amount: preview.totalAmount
+      };
+      return supabase.from('entitlement_invoices').insert([header]).select().then(function(res){
+        if(res.error || !res.data || !res.data[0]){ showToast('Could not create invoice: '+(res.error&&res.error.message), 'error'); throw res.error; }
+        var invoiceRow = res.data[0];
+        var itemRows = preview.lines.map(function(l){
+          return {
+            invoice_id: invoiceRow.id, employee_id: l.item.employeeId, employee_name: l.item.employeeName,
+            employee_email: l.item.employeeEmail, item_type: l.item.type, effective_date: l.item.effectiveDate,
+            months_billed: l.item.months, calculated_amount: l.calculatedAmount, prorated: l.selection.prorate,
+            waived: l.selection.waiveStatus==='waived', waived_reason: l.selection.waiveStatus!=='normal' ? l.selection.waiveReason : null,
+            override_amount: l.selection.waiveStatus==='custom' ? l.selection.overrideAmount : null,
+            final_amount: l.finalAmount, allocation_change_id: l.item.allocationChangeId || null,
+            per_pax_charge: (invoiceRow.invoice_type==='initial' && (l.item.type==='new_hire'||l.item.type==='initial_roster')) ? preview.rate : null
+          };
+        });
+        return supabase.from('entitlement_invoice_items').insert(itemRows).select().then(function(res2){
+          if(res2.error){ showToast('Invoice header saved but line items failed: '+res2.error.message, 'error'); throw res2.error; }
+          var savedItems = res2.data || [];
+          // Mark any invoiced promotions so they drop off the pending list.
+          var promoUpdates = preview.lines.filter(function(l){ return l.item.type==='promotion'; }).map(function(l){
+            var savedItem = savedItems.filter(function(si){ return si.allocation_change_id===l.item.allocationChangeId; })[0];
+            return supabase.from('allocation_changes').update({invoiced:true, invoice_item_id: savedItem?savedItem.id:null}).eq('id', l.item.allocationChangeId);
+          });
+          return Promise.all(promoUpdates).then(function(){
+            preview.lines.forEach(function(l){ delete STATE.entitlementSelections[l.item.key]; });
+            showToast('Invoice '+invoiceNumber+' issued.', 'success');
+            exportEntitlementInvoicePDF({invoiceRow:invoiceRow, items:savedItems});
+            return loadAppData();
+          });
+        });
+      });
+    }).then(function(){ render(); });
+  }
+
+  function voidEntitlementInvoice(id, reason){
+    if(!reason || !reason.trim()){ showToast('A reason is required to void an invoice.', 'error'); return Promise.resolve(); }
+    return supabase.from('entitlement_invoice_items').select('id').eq('invoice_id', id).then(function(res){
+      var itemIds = (res.data||[]).map(function(r){ return r.id; });
+      var resetPromo = itemIds.length ? supabase.from('allocation_changes').update({invoiced:false, invoice_item_id:null}).in('invoice_item_id', itemIds) : Promise.resolve();
+      return resetPromo.then(function(){
+        return supabase.from('entitlement_invoices').update({status:'voided', voided_reason:reason.trim(), voided_at:new Date().toISOString()}).eq('id', id);
+      });
+    }).then(function(res){
+      if(res && res.error){ showToast('Could not void invoice: '+res.error.message, 'error'); return; }
+      showToast('Invoice voided.', 'success');
+      STATE.voidingInvoice = null; STATE.voidReasonDraft='';
+      return loadAppData();
+    }).then(function(){ render(); });
   }
 
   function computeAnnualInvoice(year){
@@ -399,13 +654,59 @@
     var headcountAt = function(dateStr){
       return STATE.profiles.filter(function(p){ return employedAt(p, dateStr); }).length;
     };
-    var startHeadcount = headcountAt(startStr);
-    var endHeadcount = headcountAt(endStr);
+
+    // Anyone billed via this client's Initial Invoice already had their
+    // headcount-establishment fee collected up front for the year that
+    // invoice covered - so they're left out of THAT year's True-Up delta
+    // entirely (counted in neither the start nor end figure), otherwise the
+    // annual invoice would charge for the same headcount a second time. This
+    // only ever affects the one year the Initial Invoice covered; in every
+    // later year they're just an ordinary employee like anyone else.
+    var initialRosterEmployeeYears = {};
+    STATE.entitlementInvoiceItems.forEach(function(item){
+      if(item.item_type!=='new_hire' && item.item_type!=='initial_roster') return;
+      var inv = STATE.entitlementInvoices.filter(function(i){ return i.id===item.invoice_id && i.status==='issued'; })[0];
+      if(!inv || inv.invoice_type!=='initial') return;
+      initialRosterEmployeeYears[item.employee_id] = Number(item.effective_date.slice(0,4));
+    });
+    var isExcludedFromTrueUp = function(p){ return initialRosterEmployeeYears[p.id]===year; };
+
+    var startHeadcount = STATE.profiles.filter(function(p){ return employedAt(p, startStr) && !isExcludedFromTrueUp(p); }).length;
+    var endHeadcount = STATE.profiles.filter(function(p){ return employedAt(p, endStr) && !isExcludedFromTrueUp(p); }).length;
     var headcountDelta = endHeadcount - startHeadcount;
     var adjustmentUnits = headcountDelta/2;
     var adjustmentAmount = adjustmentUnits * rate;
     var additionalCharge = Math.max(adjustmentAmount, 0);
     var headcountCredit = Math.max(-adjustmentAmount, 0);
+
+    // What the client was actually billed for an employee's entitlement this
+    // year, in priority order: (1) an issued entitlement invoice on record
+    // for them this year - use that exact final figure, whatever it ended up
+    // being (prorated, full, waived); (2) no record, but they joined *this*
+    // year - fall back to the standard proration as a best estimate (this
+    // covers anyone added before this feature existed or before an admin
+    // got round to invoicing them); (3) anyone else (already on staff before
+    // this year, whether still employed or terminated during it) - the full
+    // annual allocation, since the client already paid for that full slot.
+    // Any promotion invoiced for them this year is added on top either way.
+    var billedMap = issuedEntitlementItemsByEmployeeYear();
+    var billedAllocationAndTrace = function(p){
+      var joinYear = p.effective_date ? Number(p.effective_date.slice(0,4)) : null;
+      var billedEntry = billedMap[p.id+'|'+year];
+      var allocation, invoiceNumber = null, months = monthsEmployedInYear(p, year);
+      if(billedEntry && billedEntry.length){
+        allocation = billedEntry.reduce(function(s,e){ return s+(Number(e.item.final_amount)||0); }, 0);
+        invoiceNumber = billedEntry.map(function(e){ return e.invoice.invoice_number; }).join(', ');
+        months = billedEntry[0].item.months_billed;
+      } else if(joinYear===year){
+        allocation = proratedAllocationForYear(p, year);
+      } else {
+        allocation = Number(p.annual_allocation)||0;
+      }
+      var promoAmount = issuedPromotionAmountForEmployeeYear(p.id, year);
+      allocation += promoAmount;
+      return {allocation:allocation, invoiceNumber:invoiceNumber, months:months, hadPromotion:promoAmount!==0};
+    };
 
     var employeesInYear = STATE.profiles.filter(function(p){ return employedDuringRange(p, startStr, endStr); });
     var totalEntitlementPool=0, totalApprovedForYear=0;
@@ -414,11 +715,11 @@
         return c.employee_id===p.id && c.status==='approved' &&
           c.receipt_date && c.receipt_date>=startStr && c.receipt_date<=endStr;
       }).reduce(function(s,c){ return s+sgdAmountOf(c); }, 0);
-      var allocation = Number(p.annual_allocation)||0;
-      var unutilized = Math.max(0, allocation-approved);
-      totalEntitlementPool += allocation;
+      var billed = billedAllocationAndTrace(p);
+      var unutilized = Math.max(0, billed.allocation-approved);
+      totalEntitlementPool += billed.allocation;
       totalApprovedForYear += approved;
-      return {name:p.name, allocation:allocation, approved:approved, unutilized:unutilized};
+      return {name:p.name, allocation:billed.allocation, approved:approved, unutilized:unutilized, invoiceNumber:billed.invoiceNumber};
     }).sort(function(a,b){ return b.unutilized-a.unutilized; });
     var totalUnutilized = unutilizedByEmployee.reduce(function(s,e){ return s+e.unutilized; }, 0);
 
@@ -427,7 +728,10 @@
 
     // Base Headcount Charge: the invoice also needs to bill for the upcoming
     // year's headcount as at 1 Jan (the year the invoice is dated), on top of
-    // the true-up adjustment for the year just closed.
+    // the true-up adjustment for the year just closed. This always counts
+    // everyone currently on the books, including anyone from an Initial
+    // Invoice - that fee only ever covered their onboarding year, not every
+    // year going forward.
     var newYearStr = (year+1)+'-01-01';
     var newYearHeadcount = headcountAt(newYearStr);
     var baseHeadcountCharge = newYearHeadcount * rate;
@@ -448,22 +752,29 @@
 
     // Supporting lists so the headcount adjustment can be audited: who counted
     // as headcount at the start of the year, and who joined or was terminated
-    // during the year (the movements that produced the net change).
-    var startHeadcountList = STATE.profiles.filter(function(p){ return employedAt(p, startStr); })
+    // during the year (the movements that produced the net change). These
+    // mirror the same Initial-Invoice exclusion as the True-Up numbers above,
+    // so the lists always add up to the same delta shown there.
+    var startHeadcountList = STATE.profiles.filter(function(p){ return employedAt(p, startStr) && !isExcludedFromTrueUp(p); })
       .map(function(p){ return {name:p.name, allocation:Number(p.annual_allocation)||0}; })
       .sort(function(a,b){ return a.name.localeCompare(b.name); });
 
     var joinedDuringYear = STATE.profiles.filter(function(p){
-      return p.role==='user' && p.effective_date && p.effective_date>startStr && p.effective_date<=endStr;
+      return p.role==='user' && p.effective_date && p.effective_date>startStr && p.effective_date<=endStr && !isExcludedFromTrueUp(p);
     });
     var terminatedDuringYear = STATE.profiles.filter(function(p){
       return p.role==='user' && p.date_of_termination && p.date_of_termination>=startStr && p.date_of_termination<=endStr;
     });
     var newJoinersList = joinedDuringYear.map(function(p){
-      return {name:p.name, allocation:Number(p.annual_allocation)||0, date:p.effective_date};
+      var billed = billedAllocationAndTrace(p);
+      return {name:p.name, allocation:billed.allocation, months:billed.months, date:p.effective_date, invoiceNumber:billed.invoiceNumber};
     }).sort(function(a,b){ return a.date.localeCompare(b.date); });
+    // Terminations always show the full annual allocation, never prorated -
+    // the client already paid for that employee's full slot for the year
+    // (either up front, or via whatever was already billed for them), so
+    // this list is purely informational about who left and when.
     var terminationsList = terminatedDuringYear.map(function(p){
-      return {name:p.name, allocation:Number(p.annual_allocation)||0, date:p.date_of_termination};
+      return {name:p.name, allocation:Number(p.annual_allocation)||0, months:monthsEmployedInYear(p, year), date:p.date_of_termination};
     }).sort(function(a,b){ return a.date.localeCompare(b.date); });
 
     return {
@@ -477,6 +788,94 @@
       newYearHeadcountList:newYearHeadcountList,
       startHeadcountList:startHeadcountList, newJoinersList:newJoinersList, terminationsList:terminationsList
     };
+  }
+
+  // Applies whatever waiver/override choices are currently set (Preview-time
+  // only, never persisted until Issue) to the two headcount-fee lines - the
+  // only two lines on the Annual Invoice a waiver makes sense for. Returns a
+  // copy of the invoice object with adjustmentAmount/baseHeadcountCharge (and
+  // everything downstream of them) recomputed off the final, post-waiver
+  // figures, plus the original calculated values for display.
+  function applyAnnualWaivers(inv){
+    var w = STATE.annualWaivers || {};
+    var adjWaiver = w.headcountAdjustment || {status:'normal'};
+    var baseWaiver = w.baseHeadcountCharge || {status:'normal'};
+    var finalAdjustment = adjWaiver.status==='waived' ? 0 : (adjWaiver.status==='custom' && adjWaiver.amount!=null ? Number(adjWaiver.amount) : inv.adjustmentAmount);
+    var finalBase = baseWaiver.status==='waived' ? 0 : (baseWaiver.status==='custom' && baseWaiver.amount!=null ? Number(baseWaiver.amount) : inv.baseHeadcountCharge);
+    var finalAdditionalCharge = Math.max(finalAdjustment, 0);
+    var finalHeadcountCredit = Math.max(-finalAdjustment, 0);
+    var finalTotalHeadcountCharge = finalBase + finalAdjustment;
+    var finalCreditNote = inv.totalUnutilized + finalHeadcountCredit;
+    var finalNetAmount = finalAdditionalCharge - finalCreditNote;
+    var finalInvoicePayable = inv.totalEntitlementPool + finalTotalHeadcountCharge - inv.totalUnutilized;
+    var out = {};
+    for(var k in inv){ out[k]=inv[k]; }
+    out.calculatedAdjustmentAmount = inv.adjustmentAmount;
+    out.calculatedBaseHeadcountCharge = inv.baseHeadcountCharge;
+    out.adjustmentAmount = finalAdjustment;
+    out.baseHeadcountCharge = finalBase;
+    out.additionalCharge = finalAdditionalCharge;
+    out.headcountCredit = finalHeadcountCredit;
+    out.totalHeadcountCharge = finalTotalHeadcountCharge;
+    out.creditNoteAmount = finalCreditNote;
+    out.netAmount = finalNetAmount;
+    out.invoicePayableAmount = finalInvoicePayable;
+    out.adjustmentWaiver = adjWaiver;
+    out.baseWaiver = baseWaiver;
+    return out;
+  }
+
+  // Issues the Annual Invoice for the currently-selected year: draws the
+  // next number off the shared sequence, freezes the full post-waiver
+  // computation into snapshot_json so a later redownload always reproduces
+  // exactly what was issued, and downloads the PDF immediately. The unique
+  // index on annual_invoices(year) where status='issued' is the real guard
+  // against double-issuing a year - this check just gives a friendlier
+  // message up front.
+  function issueAnnualInvoice(){
+    var year = getSelectedInvoiceYear();
+    var already = STATE.annualInvoices.filter(function(a){ return a.year===year && a.status==='issued'; })[0];
+    if(already){ showToast('An Annual Invoice for '+year+' has already been issued ('+already.invoice_number+'). Void it first to reissue.', 'error'); return Promise.resolve(); }
+    var inv = applyAnnualWaivers(computeAnnualInvoice(year));
+    return nextInvoiceNumber().then(function(invoiceNumber){
+      var row = {
+        invoice_number: invoiceNumber, year: year, status:'issued', issued_by: STATE.session.user.id,
+        rate_per_head: inv.rate,
+        headcount_adjustment_amount: inv.adjustmentAmount,
+        headcount_adjustment_waived: !!(inv.adjustmentWaiver && inv.adjustmentWaiver.status==='waived'),
+        headcount_adjustment_waived_reason: (inv.adjustmentWaiver && inv.adjustmentWaiver.status!=='normal') ? inv.adjustmentWaiver.reason : null,
+        headcount_adjustment_override: (inv.adjustmentWaiver && inv.adjustmentWaiver.status==='custom') ? inv.adjustmentWaiver.amount : null,
+        base_headcount_charge: inv.baseHeadcountCharge,
+        base_headcount_waived: !!(inv.baseWaiver && inv.baseWaiver.status==='waived'),
+        base_headcount_waived_reason: (inv.baseWaiver && inv.baseWaiver.status!=='normal') ? inv.baseWaiver.reason : null,
+        base_headcount_override: (inv.baseWaiver && inv.baseWaiver.status==='custom') ? inv.baseWaiver.amount : null,
+        total_headcount_charge: inv.totalHeadcountCharge,
+        total_entitlement_pool: inv.totalEntitlementPool,
+        total_unutilized: inv.totalUnutilized,
+        credit_note_amount: inv.creditNoteAmount,
+        net_amount: inv.netAmount,
+        invoice_payable_amount: inv.invoicePayableAmount,
+        snapshot_json: inv
+      };
+      return supabase.from('annual_invoices').insert([row]).select().then(function(res){
+        if(res.error || !res.data || !res.data[0]){ showToast('Could not issue Annual Invoice: '+(res.error&&res.error.message), 'error'); throw res.error; }
+        var savedRow = res.data[0];
+        STATE.annualWaivers = {};
+        showToast('Annual Invoice '+invoiceNumber+' issued.', 'success');
+        exportInvoicePDF({inv: savedRow.snapshot_json, year: year, invoiceNumber: invoiceNumber, invoiceDate: '2 Jan '+(year+1), preview:false});
+        return loadAppData();
+      });
+    }).then(function(){ render(); });
+  }
+
+  function voidAnnualInvoice(id, reason){
+    if(!reason || !reason.trim()){ showToast('A reason is required to void an invoice.', 'error'); return Promise.resolve(); }
+    return supabase.from('annual_invoices').update({status:'voided', voided_reason:reason.trim(), voided_at:new Date().toISOString()}).eq('id', id).then(function(res){
+      if(res.error){ showToast('Could not void invoice: '+res.error.message, 'error'); return; }
+      showToast('Invoice voided.', 'success');
+      STATE.voidingInvoice = null; STATE.voidReasonDraft='';
+      return loadAppData();
+    }).then(function(){ render(); });
   }
 
   function uniqueYearsFromClaims(claims, currentYear){
@@ -548,6 +947,10 @@
       calls.push(supabase.from('profiles').select('*').order('name'));
       calls.push(supabase.from('invites').select('*').order('created_at', {ascending:false}));
       calls.push(supabase.from('app_settings').select('*'));
+      calls.push(supabase.from('allocation_changes').select('*').order('created_at', {ascending:false}));
+      calls.push(supabase.from('entitlement_invoices').select('*').order('issued_at', {ascending:false}));
+      calls.push(supabase.from('entitlement_invoice_items').select('*'));
+      calls.push(supabase.from('annual_invoices').select('*').order('issued_at', {ascending:false}));
     }
     return Promise.all(calls).then(function(results){
       STATE.benefits = (results[0].data||[]).map(function(b){ return b.name; });
@@ -560,6 +963,10 @@
         STATE.invites = results[6].data || [];
         STATE.appSettings = {};
         (results[7].data||[]).forEach(function(s){ STATE.appSettings[s.key] = s.value; });
+        STATE.allocationChanges = results[8].data || [];
+        STATE.entitlementInvoices = results[9].data || [];
+        STATE.entitlementInvoiceItems = results[10].data || [];
+        STATE.annualInvoices = results[11].data || [];
       } else {
         STATE.profiles = STATE.profile ? [STATE.profile] : [];
         STATE.invites = [];
@@ -978,6 +1385,8 @@
         navTab('benefits','Benefit Categories')+
         navTab('access','User Access')+
         navTab('finance','Finance')+
+        navTab('newhire','New Hire Invoicing'+(pendingEntitlementItems().length?' <span class="badge">'+pendingEntitlementItems().length+'</span>':''))+
+        navTab('invoicehistory','Invoice History')+
         navTab('reports','Reports')+
       '</div>'+
       '<div class="content">'+
@@ -986,6 +1395,8 @@
          tab==='benefits' ? renderAdminBenefits() :
          tab==='access' ? renderAdminAccess() :
          tab==='finance' ? renderAdminFinance() :
+         tab==='newhire' ? renderAdminNewHireInvoicing() :
+         tab==='invoicehistory' ? renderAdminInvoiceHistory() :
          tab==='reports' ? renderAdminReports() :
          renderAdminApprovals())+
       '</div></div>';
@@ -1049,9 +1460,21 @@
     var visibleProfiles = STATE.profiles.filter(function(p){ return roleFilter==='all' || p.role===roleFilter; });
     var COL_COUNT = 11;
     var staffRows = visibleProfiles.map(function(p){
-      var allocCell = STATE.editingAllocId===p.id
-        ? '<input type="number" min="0" step="1" style="width:90px" id="alloc-input-'+p.id+'" value="'+p.annual_allocation+'"/> <button class="btn btn-sm btn-primary" data-action="save-alloc" data-id="'+p.id+'">Save</button>'
-        : fmtMoney(p.annual_allocation)+' <button class="link-btn" data-action="edit-alloc" data-id="'+p.id+'">Edit</button>';
+      var allocCell;
+      if(STATE.promotingEmployeeId===p.id){
+        var promoDelta = (STATE.promotionDraftAllocation||0) - (Number(p.annual_allocation)||0);
+        allocCell = '<div style="min-width:260px;">'+
+          '<div class="tiny muted" style="margin-bottom:4px;">'+fmtMoney(p.annual_allocation)+' &rarr; '+fmtMoney(STATE.promotionDraftAllocation)+' ('+(promoDelta>=0?'+':'-')+fmtMoney(Math.abs(promoDelta))+')</div>'+
+          '<label class="mini-field">Effective Date<input type="date" id="promotion-date-input-'+p.id+'" value="'+(STATE.promotionDraftDate||'')+'" style="width:150px"/></label> '+
+          '<button class="btn btn-sm btn-primary" data-action="confirm-promotion" data-id="'+p.id+'">Confirm</button> '+
+          '<button class="btn btn-sm btn-ghost" data-action="cancel-promotion" data-id="'+p.id+'">Cancel</button>'+
+          '<div class="tiny muted" style="margin-top:4px;">This '+(promoDelta>=0?'increase':'decrease')+' will show up on New Hire Invoicing for billing from the effective date above.</div>'+
+        '</div>';
+      } else {
+        allocCell = STATE.editingAllocId===p.id
+          ? '<input type="number" min="0" step="1" style="width:90px" id="alloc-input-'+p.id+'" value="'+p.annual_allocation+'"/> <button class="btn btn-sm btn-primary" data-action="save-alloc" data-id="'+p.id+'">Save</button>'
+          : fmtMoney(p.annual_allocation)+' <button class="link-btn" data-action="edit-alloc" data-id="'+p.id+'">Edit</button>';
+      }
       var terminationCell = STATE.editingTerminationId===p.id
         ? '<input type="date" style="width:150px" id="termination-input-'+p.id+'" value="'+(p.date_of_termination||'')+'"/> <button class="btn btn-sm btn-primary" data-action="save-termination" data-id="'+p.id+'">Save</button>'
         : (p.date_of_termination ? fmtDate(p.date_of_termination) : '-')+' <button class="link-btn" data-action="edit-termination" data-id="'+p.id+'">Edit</button>';
@@ -1187,21 +1610,57 @@
     return sorted;
   }
 
+  // A calculated-vs-final line for a waivable annual-invoice charge. Shows an
+  // inline Waive / Custom Amount editor when STATE.editingWaiverLine matches.
+  function waiverLineHtml(lineKey, label, calculatedValue, inv){
+    var waiver = (STATE.annualWaivers && STATE.annualWaivers[lineKey]) || {status:'normal'};
+    var finalValue = lineKey==='headcountAdjustment' ? inv.adjustmentAmount : inv.baseHeadcountCharge;
+    var statusNote = waiver.status==='waived' ? ' <span class="tiny" style="color:var(--danger);">Waived off'+(waiver.reason?(' - '+escapeHtml(waiver.reason)):'')+'</span>'
+      : waiver.status==='custom' ? ' <span class="tiny" style="color:var(--accent-dark);">Adjusted'+(waiver.reason?(' - '+escapeHtml(waiver.reason)):'')+'</span>' : '';
+    var valueHtml = waiver.status==='normal' ? '<strong>'+fmtMoney(calculatedValue)+'</strong>'
+      : '<strong><s class="muted">'+fmtMoney(calculatedValue)+'</s> '+fmtMoney(finalValue)+'</strong>'+statusNote;
+    var editorOpen = STATE.editingWaiverLine===lineKey;
+    var row = '<tr><td><strong>'+label+'</strong></td><td>'+valueHtml+' <button class="link-btn tiny" data-action="toggle-waiver-editor" data-line="'+lineKey+'">'+(editorOpen?'Close':(waiver.status==='normal'?'Waive / Adjust':'Change'))+'</button></td></tr>';
+    if(editorOpen){
+      row += '<tr><td colspan="2"><div class="table-wrap" style="margin:6px 0 4px;padding:10px;background:var(--bg);border-radius:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">'+
+        '<label class="mini-field">Status<select id="waiver-status-'+lineKey+'">'+
+          '<option value="normal" '+(waiver.status==='normal'?'selected':'')+'>Normal (as calculated)</option>'+
+          '<option value="waived" '+(waiver.status==='waived'?'selected':'')+'>Waived off ($0.00)</option>'+
+          '<option value="custom" '+(waiver.status==='custom'?'selected':'')+'>Custom amount</option>'+
+        '</select></label>'+
+        '<label class="mini-field">Custom Amount (SGD)<input type="number" step="0.01" id="waiver-amount-'+lineKey+'" style="width:120px" value="'+(waiver.amount!=null?waiver.amount:'')+'" placeholder="e.g. 50.00"/></label>'+
+        '<label class="mini-field" style="min-width:220px;">Reason (required unless Normal)<input type="text" id="waiver-reason-'+lineKey+'" value="'+escapeHtml(waiver.reason||'')+'" placeholder="e.g. first-year onboarding goodwill"/></label>'+
+        '<button class="btn btn-sm btn-primary" data-action="apply-waiver" data-line="'+lineKey+'">Apply</button>'+
+      '</div></td></tr>';
+    }
+    return row;
+  }
+
   function renderAdminFinance(){
     var year = getSelectedInvoiceYear();
     var yearOptions = buildInvoiceYearOptions();
-    var inv = computeAnnualInvoice(year);
+    var issuedAnnual = STATE.annualInvoices.filter(function(a){ return a.year===year && a.status==='issued'; })[0];
+    var isIssuedView = !!(issuedAnnual && issuedAnnual.snapshot_json);
+    var inv = isIssuedView ? issuedAnnual.snapshot_json : applyAnnualWaivers(computeAnnualInvoice(year));
     var invoiceDate = '2 Jan '+(year+1);
-    var invoiceNumber = STATE.appSettings && STATE.appSettings['invoice_number_'+year];
-    var invoiceNoLabel = invoiceNumber ? ('Invoice No: '+escapeHtml(invoiceNumber)) : 'Invoice No: assigned on export';
+    var invoiceNoLabel = isIssuedView ? ('Invoice No: '+escapeHtml(issuedAnnual.invoice_number)+' (issued '+fmtDate(issuedAnnual.issued_at.slice(0,10))+')') : 'Invoice No: assigned on Issue';
 
-    var rateCell = STATE.editingInvoiceRate
-      ? '<input type="number" min="0" step="0.01" style="width:100px" id="invoice-rate-input" value="'+inv.rate+'"/> <button class="btn btn-sm btn-primary" data-action="save-invoice-rate">Save</button>'
-      : '<span class="muted">Rate: '+fmtMoney(inv.rate)+' / head / year</span> <button class="link-btn" data-action="edit-invoice-rate">Edit</button>';
+    var rateCell = isIssuedView ? '<span class="muted">Rate used: '+fmtMoney(inv.rate)+' / head / year</span>'
+      : (STATE.editingInvoiceRate
+        ? '<input type="number" min="0" step="0.01" style="width:100px" id="invoice-rate-input" value="'+inv.rate+'"/> <button class="btn btn-sm btn-primary" data-action="save-invoice-rate">Save</button>'
+        : '<span class="muted">Rate: '+fmtMoney(inv.rate)+' / head / year</span> <button class="link-btn" data-action="edit-invoice-rate">Edit</button>');
 
     var empRows = inv.unutilizedByEmployee.map(function(e){
-      return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td><td>'+fmtMoney(e.approved)+'</td><td>'+fmtMoney(e.unutilized)+'</td></tr>';
+      return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td><td>'+fmtMoney(e.approved)+'</td><td>'+fmtMoney(e.unutilized)+'</td><td class="tiny muted">'+(e.invoiceNumber?escapeHtml(e.invoiceNumber):'&mdash;')+'</td></tr>';
     }).join('');
+
+    var actionButtons = isIssuedView
+      ? ('<button class="btn btn-ghost btn-sm" data-action="download-annual-invoice" data-id="'+issuedAnnual.id+'">Download PDF</button>'+
+         '<button class="btn btn-ghost btn-sm" data-action="start-void-invoice" data-type="annual" data-id="'+issuedAnnual.id+'">Void</button>')
+      : ('<button class="btn btn-ghost btn-sm" data-action="preview-annual-invoice">Preview PDF</button>'+
+         '<button class="btn btn-sm btn-primary" data-action="issue-annual-invoice">Issue Invoice</button>');
+
+    var voidPanel = (STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===(issuedAnnual&&issuedAnnual.id)) ? renderVoidPanel() : '';
 
     return ''+
     '<div class="card">'+
@@ -1209,10 +1668,13 @@
         '<div class="card-title">Annual Invoice</div>'+
         '<div class="report-controls" style="margin-bottom:0;">'+
           '<select data-action="set-invoice-year">'+yearOptions.map(function(y){ return '<option value="'+y+'" '+(y===year?'selected':'')+'>'+y+'</option>'; }).join('')+'</select>'+
-          '<button class="btn btn-ghost btn-sm" data-action="export-invoice-pdf">Export to PDF</button>'+
+          actionButtons+
         '</div>'+
       '</div>'+
-      '<div class="report-summary" style="margin-bottom:16px;">Period: 1 Jan '+year+' - 31 Dec '+year+' &middot; Invoice date '+invoiceDate+' &middot; '+invoiceNoLabel+' &middot; '+rateCell+'</div>'+
+      '<div class="report-summary" style="margin-bottom:16px;">Period: 1 Jan '+year+' - 31 Dec '+year+' &middot; Invoice date '+invoiceDate+' &middot; '+invoiceNoLabel+' &middot; '+rateCell+
+        (isIssuedView?'':' <span class="tiny muted">&middot; Preview only - nothing is saved until you Issue</span>')+
+      '</div>'+
+      voidPanel+
       '<div class="grid-cards">'+
         '<div class="card stat"><div class="stat-label">Total Headcount Charge</div><div class="stat-value">'+fmtMoney(inv.totalHeadcountCharge)+'</div></div>'+
         '<div class="card stat"><div class="stat-label">Unutilised Benefit</div><div class="stat-value">'+fmtMoney(inv.totalUnutilized)+'</div></div>'+
@@ -1223,21 +1685,25 @@
     '</div>'+
     '<div class="card">'+
       '<div class="card-title">Calculation Detail</div>'+
-      '<details><summary class="link-btn" style="cursor:pointer;">Headcount Adjustment (True-Up for '+year+')</summary>'+
+      '<details open><summary class="link-btn" style="cursor:pointer;">Headcount Adjustment (True-Up for '+year+')</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table"><tbody>'+
           '<tr><td>Headcount as at 1 Jan '+year+'</td><td>'+inv.startHeadcount+'</td></tr>'+
           '<tr><td>Headcount as at 31 Dec '+year+'</td><td>'+inv.endHeadcount+'</td></tr>'+
           '<tr><td>Net Change</td><td>'+inv.headcountDelta+'</td></tr>'+
           '<tr><td>Adjustment Units (Net Change &divide; 2)</td><td>'+inv.adjustmentUnits+'</td></tr>'+
           '<tr><td>Rate per Headcount</td><td>'+fmtMoney(inv.rate)+'</td></tr>'+
-          '<tr><td><strong>Headcount Adjustment Amount</strong></td><td><strong>'+fmtMoney(inv.adjustmentAmount)+'</strong></td></tr>'+
+          (isIssuedView
+            ? '<tr><td><strong>Headcount Adjustment Amount</strong></td><td><strong>'+fmtMoney(inv.adjustmentAmount)+'</strong>'+(inv.adjustmentWaiver&&inv.adjustmentWaiver.status!=='normal'?' <span class="tiny muted">('+inv.adjustmentWaiver.status+(inv.adjustmentWaiver.reason?' - '+escapeHtml(inv.adjustmentWaiver.reason):'')+')</span>':'')+'</td></tr>'
+            : waiverLineHtml('headcountAdjustment','Headcount Adjustment Amount', computeAnnualInvoice(year).adjustmentAmount, inv))+
         '</tbody></table></div>'+
       '</details>'+
       '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Headcount Charge for '+(year+1)+' ('+inv.newYearHeadcount+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table"><tbody>'+
           '<tr><td>Headcount as at 1 Jan '+(year+1)+'</td><td>'+inv.newYearHeadcount+'</td></tr>'+
           '<tr><td>Rate per Headcount</td><td>'+fmtMoney(inv.rate)+'</td></tr>'+
-          '<tr><td><strong>Base Headcount Charge</strong></td><td><strong>'+fmtMoney(inv.baseHeadcountCharge)+'</strong></td></tr>'+
+          (isIssuedView
+            ? '<tr><td><strong>Base Headcount Charge</strong></td><td><strong>'+fmtMoney(inv.baseHeadcountCharge)+'</strong>'+(inv.baseWaiver&&inv.baseWaiver.status!=='normal'?' <span class="tiny muted">('+inv.baseWaiver.status+(inv.baseWaiver.reason?' - '+escapeHtml(inv.baseWaiver.reason):'')+')</span>':'')+'</td></tr>'
+            : waiverLineHtml('baseHeadcountCharge','Base Headcount Charge', computeAnnualInvoice(year).baseHeadcountCharge, inv))+
           '<tr><td><strong>Total Headcount Charge (Base + Adjustment)</strong></td><td><strong>'+fmtMoney(inv.totalHeadcountCharge)+'</strong></td></tr>'+
         '</tbody></table></div>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
@@ -1251,13 +1717,13 @@
       '</details>'+
       '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">New Joiners in '+year+' ('+inv.newJoinersList.length+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
-        '<thead><tr><th>Employee</th><th>Effective Date</th><th>Annual Allocation</th></tr></thead>'+
-        '<tbody>'+(inv.newJoinersList.length ? inv.newJoinersList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtDate(e.date)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="3" class="muted">No new joiners recorded in '+year+'.</td></tr>')+'</tbody></table></div>'+
+        '<thead><tr><th>Employee</th><th>Effective Date</th><th>Months Billed</th><th>Entitlement</th><th>Invoice #</th></tr></thead>'+
+        '<tbody>'+(inv.newJoinersList.length ? inv.newJoinersList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtDate(e.date)+'</td><td>'+e.months+' of 12</td><td>'+fmtMoney(e.allocation)+'</td><td class="tiny muted">'+(e.invoiceNumber?escapeHtml(e.invoiceNumber):'&mdash; (estimated, not yet invoiced)')+'</td></tr>'; }).join('') : '<tr><td colspan="5" class="muted">No new joiners recorded in '+year+'.</td></tr>')+'</tbody></table></div>'+
       '</details>'+
       '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Terminations in '+year+' ('+inv.terminationsList.length+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
-        '<thead><tr><th>Employee</th><th>Termination Date</th><th>Annual Allocation</th></tr></thead>'+
-        '<tbody>'+(inv.terminationsList.length ? inv.terminationsList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtDate(e.date)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="3" class="muted">No terminations recorded in '+year+'.</td></tr>')+'</tbody></table></div>'+
+        '<thead><tr><th>Employee</th><th>Termination Date</th><th>Months Actually Employed</th><th>Annual Allocation (billed in full)</th></tr></thead>'+
+        '<tbody>'+(inv.terminationsList.length ? inv.terminationsList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtDate(e.date)+'</td><td>'+e.months+' of 12</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="4" class="muted">No terminations recorded in '+year+'.</td></tr>')+'</tbody></table></div>'+
       '</details>'+
       '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Unutilised Benefit</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table"><tbody>'+
@@ -1268,10 +1734,121 @@
       '</details>'+
       '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">By Employee</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
-        '<thead><tr><th>Employee</th><th>Entitlement</th><th>Approved Claims</th><th>Unutilised</th></tr></thead>'+
+        '<thead><tr><th>Employee</th><th>Entitlement</th><th>Approved Claims</th><th>Unutilised</th><th>Invoice #</th></tr></thead>'+
         '<tbody>'+empRows+'</tbody></table></div>'+
       '</details>'+
-      '<div class="field-hint" style="margin-top:14px;">Credit note balance can be applied to offset next year\'s benefit charges.</div>'+
+      '<div class="field-hint" style="margin-top:14px;">Credit note balance can be applied to offset next year\'s benefit charges. "Invoice #" traces an employee\'s entitlement figure back to the New Hire / Promotion invoice that actually billed it - a dash means no such invoice exists on record and the full or estimated allocation was used instead.</div>'+
+    '</div>';
+  }
+
+  function renderVoidPanel(){
+    return '<div class="info-banner banner-warning" style="margin-bottom:14px;">'+
+      '<div style="font-weight:700;margin-bottom:8px;">Void this invoice</div>'+
+      '<label class="mini-field" style="margin-bottom:8px;">Reason (required)<input type="text" id="void-reason-input" value="'+escapeHtml(STATE.voidReasonDraft||'')+'" placeholder="e.g. client disputed the headcount figure" style="width:100%;max-width:420px;"/></label>'+
+      '<div><button class="btn btn-sm btn-primary" data-action="confirm-void-invoice">Confirm Void</button> '+
+      '<button class="btn btn-sm btn-ghost" data-action="cancel-void-invoice">Cancel</button></div>'+
+    '</div>';
+  }
+
+  function entitlementItemRowHtml(item){
+    var sel = getEntitlementSelection(item.key, item.defaultProrate);
+    var finalAmount = finalAmountForSelection(item, sel);
+    var calculatedAmount = sel.prorate ? item.proratedAmount : item.fullAmount;
+    var typeLabel = item.type==='promotion' ? 'Promotion / Adjustment' : 'New Hire';
+    var waiveOpen = STATE.editingWaiverLine===item.key;
+    var amountHtml = sel.waiveStatus==='normal' ? fmtMoney(calculatedAmount)
+      : '<s class="muted">'+fmtMoney(calculatedAmount)+'</s> '+fmtMoney(finalAmount)+(sel.waiveStatus==='waived'?' <span class="tiny" style="color:var(--danger);">Waived off</span>':' <span class="tiny" style="color:var(--accent-dark);">Adjusted</span>');
+    var row = '<tr>'+
+      '<td><input type="checkbox" data-action="toggle-entitlement-check" data-key="'+item.key+'" '+(sel.checked?'checked':'')+'/></td>'+
+      '<td>'+escapeHtml(item.employeeName)+(item.employeeEmail?'<div class="tiny muted">'+escapeHtml(item.employeeEmail)+'</div>':'')+'</td>'+
+      '<td>'+typeLabel+(item.type==='promotion'?'<div class="tiny muted">'+fmtMoney(item.oldAllocation)+' &rarr; '+fmtMoney(item.newAllocation)+'</div>':'')+'</td>'+
+      '<td>'+fmtDate(item.effectiveDate)+'</td>'+
+      '<td><label class="tiny"><input type="checkbox" data-action="toggle-entitlement-prorate" data-key="'+item.key+'" '+(sel.prorate?'checked':'')+'/> Prorate ('+item.months+' of 12)</label></td>'+
+      '<td>'+amountHtml+' <button class="link-btn tiny" data-action="toggle-entitlement-waiver" data-key="'+item.key+'">'+(waiveOpen?'Close':(sel.waiveStatus==='normal'?'Waive/Adjust':'Change'))+'</button></td>'+
+    '</tr>';
+    if(waiveOpen){
+      row += '<tr><td colspan="6"><div style="margin:6px 0 4px;padding:10px;background:var(--bg);border-radius:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">'+
+        '<label class="mini-field">Status<select id="ent-waiver-status-'+item.key+'">'+
+          '<option value="normal" '+(sel.waiveStatus==='normal'?'selected':'')+'>Normal (as calculated)</option>'+
+          '<option value="waived" '+(sel.waiveStatus==='waived'?'selected':'')+'>Waived off ($0.00)</option>'+
+          '<option value="custom" '+(sel.waiveStatus==='custom'?'selected':'')+'>Custom amount</option>'+
+        '</select></label>'+
+        '<label class="mini-field">Custom Amount (SGD)<input type="number" step="0.01" id="ent-waiver-amount-'+item.key+'" style="width:120px" value="'+(sel.overrideAmount!=null?sel.overrideAmount:'')+'"/></label>'+
+        '<label class="mini-field" style="min-width:220px;">Reason (required unless Normal)<input type="text" id="ent-waiver-reason-'+item.key+'" value="'+escapeHtml(sel.waiveReason||'')+'"/></label>'+
+        '<button class="btn btn-sm btn-primary" data-action="apply-entitlement-waiver" data-key="'+item.key+'">Apply</button>'+
+      '</div></td></tr>';
+    }
+    return row;
+  }
+
+  function renderAdminNewHireInvoicing(){
+    var allPending = pendingEntitlementItems();
+    var from = STATE.entitlementDateFrom, to = STATE.entitlementDateTo;
+    var pending = allPending.filter(function(item){
+      if(from && item.effectiveDate<from) return false;
+      if(to && item.effectiveDate>to) return false;
+      return true;
+    });
+    var preview = computeEntitlementInvoicePreview();
+    var isInitial = preview.invoiceType==='initial';
+    var rows = pending.map(entitlementItemRowHtml).join('');
+
+    return ''+
+    '<div class="card">'+
+      '<div class="card-title">New Hire Invoicing</div>'+
+      '<div class="field-hint" style="margin-bottom:14px;">Every employee who hasn\'t yet been entitlement-invoiced, and every allocation change (promotion) awaiting invoicing - across any date range, not just one month. Tick whoever you\'re billing now; unticked rows just stay here for next time.'+
+        (isInitial ? ' <strong>This will be this client\'s Initial Invoice</strong> - it also adds a one-time per-pax headcount establishment charge for every employee included.' : '')+
+      '</div>'+
+      '<div class="report-controls" style="margin-bottom:14px;">'+
+        '<label class="mini-field">From<input type="date" data-action="set-entitlement-date-from" value="'+(from||'')+'"/></label>'+
+        '<label class="mini-field">To<input type="date" data-action="set-entitlement-date-to" value="'+(to||'')+'"/></label>'+
+        (from||to ? '<button class="link-btn" data-action="clear-entitlement-date-filter">Clear filter</button>' : '')+
+      '</div>'+
+      (pending.length ? (
+      '<div class="table-wrap"><table class="data-table">'+
+        '<thead><tr><th></th><th>Employee</th><th>Type</th><th>Effective Date</th><th>Prorate</th><th>Amount</th></tr></thead>'+
+        '<tbody>'+rows+'</tbody>'+
+      '</table></div>')
+      : '<div class="empty-state">Nothing pending - every employee and allocation change has already been invoiced.</div>')+
+      (preview.lines.length ? (
+      '<div class="report-summary" style="margin-top:16px;">'+
+        (isInitial ? ('Per-Pax Establishment Charge: '+preview.headcountForPax+' &times; '+fmtMoney(preview.rate)+' = '+fmtMoney(preview.perPaxTotal)+' &middot; ') : '')+
+        'Entitlement Total: '+fmtMoney(preview.entitlementTotal)+' &middot; <strong>Total Amount: '+fmtMoney(preview.totalAmount)+'</strong>'+
+      '</div>'+
+      '<div style="margin-top:12px;">'+
+        '<button class="btn btn-ghost btn-sm" data-action="preview-entitlement-invoice">Preview PDF</button> '+
+        '<button class="btn btn-sm btn-primary" data-action="issue-entitlement-invoice">Issue Invoice</button>'+
+      '</div>'+
+      '<div class="tiny muted" style="margin-top:6px;">Preview is a live calculation only - nothing is saved or numbered until you Issue.</div>')
+      : '')+
+    '</div>';
+  }
+
+  function renderAdminInvoiceHistory(){
+    var entRows = STATE.entitlementInvoices.slice().sort(function(a,b){ return (b.issued_at||'').localeCompare(a.issued_at||''); }).map(function(inv){
+      var itemCount = STATE.entitlementInvoiceItems.filter(function(i){ return i.invoice_id===inv.id; }).length;
+      var typeLabel = inv.invoice_type==='initial' ? 'Initial Roster Invoice' : 'New Hire / Promotion Invoice';
+      var statusHtml = inv.status==='voided' ? '<span class="tiny" style="color:var(--danger);">Voided'+(inv.voided_reason?(' - '+escapeHtml(inv.voided_reason)):'')+'</span>' : '<span class="tiny" style="color:var(--success);">Issued</span>';
+      var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="entitlement" data-id="'+inv.id+'">Void</button>' : '';
+      return '<tr><td>'+escapeHtml(inv.invoice_number)+'</td><td>'+typeLabel+'</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>'+itemCount+'</td><td>'+fmtMoney(inv.total_amount)+'</td><td>'+statusHtml+'</td>'+
+        '<td><button class="link-btn tiny" data-action="download-entitlement-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
+        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='entitlement' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
+    }).join('');
+    var annRows = STATE.annualInvoices.slice().sort(function(a,b){ return (b.issued_at||'').localeCompare(a.issued_at||''); }).map(function(inv){
+      var statusHtml = inv.status==='voided' ? '<span class="tiny" style="color:var(--danger);">Voided'+(inv.voided_reason?(' - '+escapeHtml(inv.voided_reason)):'')+'</span>' : '<span class="tiny" style="color:var(--success);">Issued</span>';
+      var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="annual" data-id="'+inv.id+'">Void</button>' : '';
+      return '<tr><td>'+escapeHtml(inv.invoice_number)+'</td><td>Annual Invoice ('+inv.year+')</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>&mdash;</td><td>'+fmtMoney(inv.invoice_payable_amount)+'</td><td>'+statusHtml+'</td>'+
+        '<td><button class="link-btn tiny" data-action="download-annual-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
+        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
+    }).join('');
+    var allRows = entRows+annRows;
+    return '<div class="card">'+
+      '<div class="card-title">Invoice History</div>'+
+      '<div class="field-hint" style="margin-bottom:14px;">Every invoice ever issued to this client - Annual Invoices and New Hire / Promotion / Initial Roster invoices together, newest first. Each is re-downloadable exactly as issued. Voiding requires a reason and keeps the original visible here for the record; a corrected invoice issued afterward gets the next number in sequence.</div>'+
+      (allRows ? ('<div class="table-wrap"><table class="data-table">'+
+        '<thead><tr><th>Invoice #</th><th>Type</th><th>Issued</th><th>Employees</th><th>Amount</th><th>Status</th><th></th></tr></thead>'+
+        '<tbody>'+allRows+'</tbody></table></div>')
+        : '<div class="empty-state">No invoices issued yet.</div>')+
     '</div>';
   }
 
@@ -1607,12 +2184,27 @@
     }
   }
 
-  function exportInvoicePDF(invoiceNumber){
+  // opts: {inv (already waiver-applied), year, invoiceNumber, invoiceDate, preview (bool)}
+  // preview=true draws a "DRAFT - NOT YET ISSUED" watermark instead of a real
+  // invoice number, for the Preview action; Issue and Invoice History
+  // downloads pass preview=false with the real assigned number.
+  function exportInvoicePDF(opts){
     if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){ showToast('PDF export library did not load (needs an internet connection).', 'error'); return; }
-    var year = getSelectedInvoiceYear();
-    var inv = computeAnnualInvoice(year);
-    var invoiceDate = '2 Jan '+(year+1);
+    var year = opts.year;
+    var inv = opts.inv;
+    var invoiceNumber = opts.preview ? 'DRAFT - NOT YET ISSUED' : opts.invoiceNumber;
+    var invoiceDate = opts.invoiceDate;
     var adjustmentLabel = inv.adjustmentAmount>=0 ? 'Additional Headcount Charge' : 'Headcount Reduction Credit';
+    var adjWaiver = inv.adjustmentWaiver || {status:'normal'};
+    var baseWaiver = inv.baseWaiver || {status:'normal'};
+    var adjWaiverNote = adjWaiver.status!=='normal' ? (' ['+(adjWaiver.status==='waived'?'Waived off':'Adjusted')+(adjWaiver.reason?' - '+adjWaiver.reason:'')+']') : '';
+    var baseWaiverNote = baseWaiver.status!=='normal' ? (' ['+(baseWaiver.status==='waived'?'Waived off':'Adjusted')+(baseWaiver.reason?' - '+baseWaiver.reason:'')+']') : '';
+    var adjustmentValueText = (adjWaiver.status!=='normal' && inv.calculatedAdjustmentAmount!=null)
+      ? ('Calculated '+fmtMoney(Math.abs(inv.calculatedAdjustmentAmount))+' -> Billed '+fmtMoney(Math.abs(inv.adjustmentAmount))+adjWaiverNote)
+      : fmtMoney(Math.abs(inv.adjustmentAmount));
+    var baseChargeValueText = (baseWaiver.status!=='normal' && inv.calculatedBaseHeadcountCharge!=null)
+      ? ('Calculated '+fmtMoney(inv.calculatedBaseHeadcountCharge)+' -> Billed '+fmtMoney(inv.baseHeadcountCharge)+baseWaiverNote)
+      : fmtMoney(inv.baseHeadcountCharge);
 
     try{
       var doc = new window.jspdf.jsPDF({unit:'mm', format:'a4'});
@@ -1637,7 +2229,8 @@
       doc.setTextColor(40,40,40);
       doc.setFontSize(9);
       doc.text('Invoice Date: '+invoiceDate, margin, 46);
-      doc.text('Invoice No: '+invoiceNumber, margin, 52);
+      if(opts.preview){ doc.setTextColor(200,120,0); doc.text('Invoice No: '+invoiceNumber, margin, 52); doc.setTextColor(40,40,40); }
+      else { doc.text('Invoice No: '+invoiceNumber, margin, 52); }
       doc.text('Period Covered: 1 Jan '+year+' - 31 Dec '+year, margin, 58);
 
       var cy = 68;
@@ -1651,7 +2244,7 @@
           ['Net Change', String(inv.headcountDelta)],
           ['Adjustment Units (Net Change / 2)', String(inv.adjustmentUnits)],
           ['Rate per Headcount per Year', fmtMoney(inv.rate)],
-          [adjustmentLabel, fmtMoney(Math.abs(inv.adjustmentAmount))]
+          [adjustmentLabel, adjustmentValueText]
         ],
         theme:'plain', styles:{fontSize:10, cellPadding:1.5},
         columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
@@ -1665,7 +2258,7 @@
         body: [
           ['Headcount as at 1 Jan '+(year+1), String(inv.newYearHeadcount)],
           ['Rate per Headcount per Year', fmtMoney(inv.rate)],
-          ['Base Headcount Charge', fmtMoney(inv.baseHeadcountCharge)],
+          ['Base Headcount Charge', baseChargeValueText],
           ['Total Headcount Charge (Base + Adjustment)', fmtMoney(inv.totalHeadcountCharge)]
         ],
         theme:'plain', styles:{fontSize:10, cellPadding:1.5},
@@ -1747,10 +2340,10 @@
       doc.text('Sorted by Effective Date - the joiners behind the net change above.', margin, 24);
       var joinersCy = 30;
       if(inv.newJoinersList.length){
-        var joinerRows = inv.newJoinersList.map(function(e){ return [e.name, fmtDate(e.date), fmtMoney(e.allocation)]; });
+        var joinerRows = inv.newJoinersList.map(function(e){ return [e.name, fmtDate(e.date), e.months+' of 12', fmtMoney(e.allocation), e.invoiceNumber||'(estimated, not yet invoiced)']; });
         doc.autoTable({
           startY: joinersCy, margin:{left:margin, right:margin},
-          head:[['Employee','Effective Date','Annual Allocation (SGD)']], body: joinerRows,
+          head:[['Employee','Effective Date','Months Billed','Prorated Entitlement (SGD)','Invoice #']], body: joinerRows,
           theme:'grid', headStyles:{fillColor:brandColor}, styles:{fontSize:9}
         });
         joinersCy = doc.lastAutoTable.finalY + 16;
@@ -1765,10 +2358,10 @@
       doc.setFontSize(9); doc.setTextColor(100,100,100);
       doc.text('Sorted by Termination Date - the departures behind the net change above.', margin, joinersCy+6);
       if(inv.terminationsList.length){
-        var terminationRows = inv.terminationsList.map(function(e){ return [e.name, fmtDate(e.date), fmtMoney(e.allocation)]; });
+        var terminationRows = inv.terminationsList.map(function(e){ return [e.name, fmtDate(e.date), e.months+' of 12', fmtMoney(e.allocation)]; });
         doc.autoTable({
           startY: joinersCy+12, margin:{left:margin, right:margin},
-          head:[['Employee','Termination Date','Annual Allocation (SGD)']], body: terminationRows,
+          head:[['Employee','Termination Date','Months Billed','Prorated Entitlement (SGD)']], body: terminationRows,
           theme:'grid', headStyles:{fillColor:brandColor}, styles:{fontSize:9}
         });
       } else {
@@ -1779,16 +2372,157 @@
       doc.addPage();
       doc.setFontSize(14); doc.setTextColor(brandColor[0],brandColor[1],brandColor[2]);
       doc.text('Unutilised Amount by Employee - '+year, margin, 18);
+      doc.setFontSize(9); doc.setTextColor(100,100,100);
+      doc.text('"Invoice #" traces this figure back to the New Hire/Promotion invoice that billed it - blank means the full or estimated allocation was used.', margin, 24);
       var empRows = inv.unutilizedByEmployee.map(function(e){
-        return [e.name, fmtMoney(e.allocation), fmtMoney(e.approved), fmtMoney(e.unutilized)];
+        return [e.name, fmtMoney(e.allocation), fmtMoney(e.approved), fmtMoney(e.unutilized), e.invoiceNumber||''];
       });
       doc.autoTable({
-        startY: 24, margin:{left:margin, right:margin},
-        head:[['Employee','Entitlement (SGD)','Approved Claims (SGD)','Unutilised (SGD)']], body: empRows,
+        startY: 29, margin:{left:margin, right:margin},
+        head:[['Employee','Entitlement (SGD)','Approved Claims (SGD)','Unutilised (SGD)','Invoice #']], body: empRows,
         theme:'grid', headStyles:{fillColor:brandColor}, styles:{fontSize:9}
       });
 
-      doc.save('flex-benefits-invoice-'+year+'.pdf');
+      var fileTag = opts.preview ? ('DRAFT-'+year) : String(invoiceNumber).replace(/[^A-Za-z0-9-]/g,'');
+      doc.save('flex-benefits-invoice-'+fileTag+'.pdf');
+    }catch(err){
+      console.error(err);
+      showToast('Could not generate the invoice PDF. Check the console for details.', 'error');
+    }
+  }
+
+  // Entitlement invoice PDF (New Hire / Promotion / Initial Roster). Per
+  // Tin's feedback, this is issued BY Cresco but reads softer than the
+  // Annual Invoice - the Cresco red is used as a thin accent (a rule under
+  // the header, a small tick before each section heading, and the table
+  // header outline) rather than a full solid banner.
+  //
+  // opts is either {invoiceRow, items} for an already-issued invoice
+  // (Issue action or a re-download from history), or {preview:true,
+  // previewData} for a live Preview - previewData is whatever
+  // computeEntitlementInvoicePreview() returned, nothing saved or numbered.
+  function exportEntitlementInvoicePDF(opts){
+    if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){ showToast('PDF export library did not load (needs an internet connection).', 'error'); return; }
+    try{
+      var isPreview = !!opts.preview;
+      var previewData = opts.previewData;
+      var invoiceRow = opts.invoiceRow;
+      var invoiceType = isPreview ? previewData.invoiceType : invoiceRow.invoice_type;
+      var isInitial = invoiceType==='initial';
+      var invoiceNumber = isPreview ? 'DRAFT - NOT YET ISSUED' : invoiceRow.invoice_number;
+      var invoiceDate = isPreview ? fmtDate(new Date().toISOString().slice(0,10)) : fmtDate((invoiceRow.issued_at||'').slice(0,10));
+
+      var lines = isPreview
+        ? previewData.lines.map(function(l){
+            return {
+              employeeName: l.item.employeeName, itemType: l.item.type, effectiveDate: l.item.effectiveDate,
+              monthsBilled: l.item.months, prorated: l.selection.prorate,
+              calculatedAmount: l.calculatedAmount, finalAmount: l.finalAmount,
+              waiveStatus: l.selection.waiveStatus, waiveReason: l.selection.waiveReason
+            };
+          })
+        : (opts.items||[]).map(function(it){
+            return {
+              employeeName: it.employee_name, itemType: it.item_type, effectiveDate: it.effective_date,
+              monthsBilled: it.months_billed, prorated: it.prorated,
+              calculatedAmount: it.calculated_amount, finalAmount: it.final_amount,
+              waiveStatus: it.waived ? 'waived' : (it.override_amount!=null ? 'custom' : 'normal'), waiveReason: it.waived_reason
+            };
+          });
+      var entitlementTotal = isPreview ? previewData.entitlementTotal : (Number(invoiceRow.entitlement_total)||0);
+      var perPaxRate = isPreview ? (isInitial?previewData.rate:null) : invoiceRow.per_pax_rate;
+      var perPaxTotal = isPreview ? previewData.perPaxTotal : (Number(invoiceRow.per_pax_total)||0);
+      var headcountForPax = isPreview ? previewData.headcountForPax : lines.filter(function(l){ return l.itemType!=='promotion'; }).length;
+      var totalAmount = isPreview ? previewData.totalAmount : (Number(invoiceRow.total_amount)||0);
+
+      var doc = new window.jspdf.jsPDF({unit:'mm', format:'a4'});
+      var pageWidth = doc.internal.pageSize.getWidth();
+      var margin = 15;
+      var accent = CRESCO_COLOR_RGB;
+
+      var logoW = 30, logoH = logoW*(90/285);
+      doc.addImage(CRESCO_LOGO_DATA_URI, 'PNG', margin, 10, logoW, logoH);
+      doc.setTextColor(50,50,50);
+      doc.setFontSize(15);
+      doc.text(isInitial ? 'Initial Roster Invoice' : 'New Hire / Promotion Invoice', pageWidth-margin, 16, {align:'right'});
+      doc.setFontSize(9);
+      doc.setTextColor(120,120,120);
+      doc.text('Entitlement Billing - Flex Benefits Portal by Cresco Insurance Agency Pte Ltd', pageWidth-margin, 22, {align:'right'});
+      doc.setDrawColor(accent[0],accent[1],accent[2]);
+      doc.setLineWidth(0.8);
+      doc.line(margin, 27, pageWidth-margin, 27);
+
+      doc.setTextColor(40,40,40);
+      doc.setFontSize(9);
+      var iy = 35;
+      doc.text('Invoice Date: '+invoiceDate, margin, iy);
+      if(isPreview){ doc.setTextColor(200,120,0); doc.text('Invoice No: '+invoiceNumber, margin, iy+6); doc.setTextColor(40,40,40); }
+      else { doc.text('Invoice No: '+invoiceNumber, margin, iy+6); }
+      doc.text('Bill To: '+getClientCompanyName(), margin, iy+12);
+
+      var sectionHeading = function(text, y){
+        doc.setFillColor(accent[0],accent[1],accent[2]);
+        doc.rect(margin, y-4, 2.2, 4.6, 'F');
+        doc.setFontSize(12); doc.setTextColor(40,40,40);
+        doc.text(text, margin+5, y);
+      };
+
+      var cy = iy+24;
+      sectionHeading((isInitial?'Initial Roster - ':'')+'Entitlement Charges', cy);
+      cy += 5;
+      var rows = lines.map(function(l){
+        var typeLabel = l.itemType==='promotion' ? 'Promotion' : (isInitial ? 'Initial Roster' : 'New Hire');
+        var amountText = (l.waiveStatus && l.waiveStatus!=='normal')
+          ? ('Calc. '+fmtMoney(l.calculatedAmount)+' -> '+(l.waiveStatus==='waived'?'Waived off':fmtMoney(l.finalAmount))+(l.waiveReason?' ('+l.waiveReason+')':''))
+          : fmtMoney(l.finalAmount);
+        return [l.employeeName, typeLabel, fmtDate(l.effectiveDate), l.prorated?(l.monthsBilled+' of 12'):'Full year', amountText];
+      });
+      doc.autoTable({
+        startY: cy, margin:{left:margin, right:margin},
+        head:[['Employee','Type','Effective Date','Billed As','Amount (SGD)']], body: rows.length?rows:[['No line items on this invoice.','','','','']],
+        theme:'grid', headStyles:{fillColor:[247,247,247], textColor:[60,60,60], fontStyle:'bold', lineColor:accent, lineWidth:0.3},
+        styles:{fontSize:9, lineColor:[225,225,225]}
+      });
+      cy = doc.lastAutoTable.finalY + 12;
+
+      if(isInitial){
+        sectionHeading('Headcount Establishment Charge', cy);
+        cy += 5;
+        doc.autoTable({
+          startY: cy, margin:{left:margin, right:margin},
+          body: [
+            ['Employees Established', String(headcountForPax)],
+            ['Rate per Head (one-time, flat - not prorated)', fmtMoney(perPaxRate)],
+            ['Per-Pax Establishment Total', fmtMoney(perPaxTotal)]
+          ],
+          theme:'plain', styles:{fontSize:10, cellPadding:1.5},
+          columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
+        });
+        cy = doc.lastAutoTable.finalY + 12;
+      }
+
+      sectionHeading('Invoice Summary', cy);
+      cy += 5;
+      var summaryBody = [['Entitlement Total', fmtMoney(entitlementTotal)]];
+      if(isInitial) summaryBody.push(['Per-Pax Establishment Total', fmtMoney(perPaxTotal)]);
+      summaryBody.push(['Total Amount Due', fmtMoney(totalAmount)]);
+      doc.autoTable({
+        startY: cy, margin:{left:margin, right:margin},
+        body: summaryBody,
+        theme:'grid', headStyles:{fillColor:accent},
+        styles:{fontSize:10, cellPadding:2},
+        columnStyles:{0:{fontStyle:'bold', cellWidth:110}},
+        didParseCell: function(data){
+          if(data.row.index===summaryBody.length-1){ data.cell.styles.fontStyle='bold'; data.cell.styles.fillColor=[250,240,241]; }
+        }
+      });
+      cy = doc.lastAutoTable.finalY + 10;
+      doc.setFontSize(8); doc.setTextColor(120,120,120);
+      var footNote = doc.splitTextToSize('This invoice bills entitlement dollars only - any headcount adjustment or base headcount charge for this client is billed separately on the Annual Invoice.'+(isPreview?' This is a draft preview - nothing has been saved or numbered yet.':''), pageWidth-margin*2);
+      doc.text(footNote, margin, cy);
+
+      var fileTag = isPreview ? 'DRAFT' : String(invoiceNumber).replace(/[^A-Za-z0-9-]/g,'');
+      doc.save('entitlement-invoice-'+fileTag+'.pdf');
     }catch(err){
       console.error(err);
       showToast('Could not generate the invoice PDF. Check the console for details.', 'error');
@@ -2164,8 +2898,14 @@
           var dateOfJoining = parts[7] && parts[7].length ? parts[7] : null;
           var paynowMobile = parts[8] && parts[8].length ? parts[8] : null;
           var effectiveDate = parts[9] && parts[9].length ? parts[9] : null;
+          // Optional 11th column: prorateEntitlement (Yes/No) pre-sets the
+          // New Hire Invoicing tab's "Prorate" checkbox default for this
+          // employee. Left blank, defaults to true (prorated) - same as the
+          // checkbox's own default.
+          var prorateRaw = parts[10] && parts[10].length ? parts[10] : null;
+          var prorateEntitlementDefault = prorateRaw==null ? true : /^y/i.test(prorateRaw);
           if(!name || !email){ skipped++; continue; }
-          inviteRows.push({email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfJoining, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric:nric2, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false});
+          inviteRows.push({email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfJoining, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric:nric2, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false, prorate_entitlement_default:prorateEntitlementDefault});
         } else {
           skipped++;
         }
@@ -2278,16 +3018,61 @@
     }).then(function(){ render(); });
   }
 
+  // Changing an existing employee's allocation to a DIFFERENT figure is a
+  // mid-year entitlement change (a promotion, or a correction) - rather than
+  // saving it straight away, this opens an inline "give it an effective
+  // date" prompt (confirmPromotion/cancelPromotion below), because the
+  // company still needs to be billed for the delta and that billing is
+  // tracked from an effective date, same as a new hire's join date. Saving
+  // with the SAME figure (e.g. clicking Save with no actual change) just
+  // closes the editor as before - nothing to invoice there.
   function saveAlloc(id){
     var input = document.getElementById('alloc-input-'+id);
     var val = input ? parseFloat(input.value) : NaN;
     if(isNaN(val) || val<0){ showToast('Please enter a valid allocation amount.', 'error'); return Promise.resolve(); }
+    var p = profileById(id);
+    var oldVal = p ? (Number(p.annual_allocation)||0) : 0;
+    if(p && val!==oldVal){
+      STATE.editingAllocId = null;
+      STATE.promotingEmployeeId = id;
+      STATE.promotionDraftAllocation = val;
+      STATE.promotionDraftDate = STATE.promotionDraftDate || new Date().toISOString().slice(0,10);
+      render();
+      return Promise.resolve();
+    }
     STATE.editingAllocId = null;
     return supabase.from('profiles').update({annual_allocation:val}).eq('id', id).then(function(res){
       if(res.error){ showToast('Could not update allocation: '+res.error.message, 'error'); return; }
       showToast('Allocation updated.', 'success');
       return loadAppData();
     }).then(function(){ render(); });
+  }
+
+  function confirmPromotion(id){
+    var dateInput = document.getElementById('promotion-date-input-'+id);
+    var effectiveDate = dateInput ? dateInput.value : STATE.promotionDraftDate;
+    if(!effectiveDate){ showToast('Please choose an effective date for this allocation change.', 'error'); return Promise.resolve(); }
+    var p = profileById(id);
+    if(!p){ cancelPromotion(); return Promise.resolve(); }
+    var oldVal = Number(p.annual_allocation)||0;
+    var newVal = STATE.promotionDraftAllocation;
+    return supabase.from('profiles').update({annual_allocation:newVal}).eq('id', id).then(function(res){
+      if(res.error){ showToast('Could not update allocation: '+res.error.message, 'error'); throw res.error; }
+      return supabase.from('allocation_changes').insert([{
+        employee_id:id, old_allocation:oldVal, new_allocation:newVal, effective_date:effectiveDate,
+        created_by: STATE.session.user.id
+      }]);
+    }).then(function(res2){
+      if(res2 && res2.error){ showToast('Allocation saved, but could not record it for invoicing: '+res2.error.message, 'error'); }
+      else { showToast('Allocation updated - the change will appear on New Hire Invoicing for billing.', 'success'); }
+      STATE.promotingEmployeeId = null; STATE.promotionDraftAllocation = null; STATE.promotionDraftDate = null;
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
+  function cancelPromotion(){
+    STATE.promotingEmployeeId = null; STATE.promotionDraftAllocation = null; STATE.promotionDraftDate = null;
+    render();
   }
 
   function saveTermination(id){
@@ -2434,9 +3219,78 @@
       case 'save-invoice-rate': return saveInvoiceRate();
       case 'edit-client-name': STATE.editingClientName=true; render(); return Promise.resolve();
       case 'save-client-name': return saveClientName();
-      case 'export-invoice-pdf': return ensureInvoiceNumber(getSelectedInvoiceYear()).then(function(invoiceNumber){ exportInvoicePDF(invoiceNumber); render(); });
       case 'filter-history': STATE.historyFilter=btn.dataset.filter; render(); return Promise.resolve();
       case 'filter-staff': STATE.staffRoleFilter=btn.dataset.filter; render(); return Promise.resolve();
+      case 'confirm-promotion': return confirmPromotion(id);
+      case 'cancel-promotion': cancelPromotion(); return Promise.resolve();
+
+      /* ---- Annual Invoice: Preview / Issue / Download / waivers ---- */
+      case 'preview-annual-invoice': {
+        var pyear = getSelectedInvoiceYear();
+        exportInvoicePDF({inv: applyAnnualWaivers(computeAnnualInvoice(pyear)), year: pyear, invoiceDate: '2 Jan '+(pyear+1), preview:true});
+        return Promise.resolve();
+      }
+      case 'issue-annual-invoice': return issueAnnualInvoice();
+      case 'download-annual-invoice': {
+        var annRow = STATE.annualInvoices.filter(function(a){ return a.id===id; })[0];
+        if(annRow) exportInvoicePDF({inv: annRow.snapshot_json, year: annRow.year, invoiceNumber: annRow.invoice_number, invoiceDate:'2 Jan '+(annRow.year+1), preview:false});
+        return Promise.resolve();
+      }
+      case 'toggle-waiver-editor': STATE.editingWaiverLine = (STATE.editingWaiverLine===btn.dataset.line ? null : btn.dataset.line); render(); return Promise.resolve();
+      case 'apply-waiver': {
+        var lineKey = btn.dataset.line;
+        var wStatusEl = document.getElementById('waiver-status-'+lineKey);
+        var wAmountEl = document.getElementById('waiver-amount-'+lineKey);
+        var wReasonEl = document.getElementById('waiver-reason-'+lineKey);
+        var wStatus = wStatusEl ? wStatusEl.value : 'normal';
+        var wReason = wReasonEl ? wReasonEl.value.trim() : '';
+        var wAmount = wAmountEl ? parseFloat(wAmountEl.value) : NaN;
+        if(wStatus!=='normal' && !wReason){ showToast('A reason is required to waive or adjust this line.', 'error'); return Promise.resolve(); }
+        if(wStatus==='custom' && isNaN(wAmount)){ showToast('Enter a custom amount.', 'error'); return Promise.resolve(); }
+        if(!STATE.annualWaivers) STATE.annualWaivers = {};
+        STATE.annualWaivers[lineKey] = {status:wStatus, amount: wStatus==='custom'?wAmount:null, reason: wStatus==='normal'?'':wReason};
+        STATE.editingWaiverLine = null;
+        render();
+        return Promise.resolve();
+      }
+
+      /* ---- Entitlement (New Hire / Promotion) Invoicing ---- */
+      case 'preview-entitlement-invoice': exportEntitlementInvoicePDF({preview:true, previewData: computeEntitlementInvoicePreview()}); return Promise.resolve();
+      case 'issue-entitlement-invoice': return issueEntitlementInvoice();
+      case 'download-entitlement-invoice': {
+        var entRow = STATE.entitlementInvoices.filter(function(i){ return i.id===id; })[0];
+        var entItems = STATE.entitlementInvoiceItems.filter(function(i){ return i.invoice_id===id; });
+        if(entRow) exportEntitlementInvoicePDF({invoiceRow:entRow, items:entItems});
+        return Promise.resolve();
+      }
+      case 'toggle-entitlement-waiver': STATE.editingWaiverLine = (STATE.editingWaiverLine===btn.dataset.key ? null : btn.dataset.key); render(); return Promise.resolve();
+      case 'apply-entitlement-waiver': {
+        var ewKey = btn.dataset.key;
+        var statusEl = document.getElementById('ent-waiver-status-'+ewKey);
+        var amountEl = document.getElementById('ent-waiver-amount-'+ewKey);
+        var reasonEl = document.getElementById('ent-waiver-reason-'+ewKey);
+        var ewStatus = statusEl ? statusEl.value : 'normal';
+        var ewReason = reasonEl ? reasonEl.value.trim() : '';
+        var ewAmount = amountEl ? parseFloat(amountEl.value) : NaN;
+        if(ewStatus!=='normal' && !ewReason){ showToast('A reason is required to waive or adjust this line.', 'error'); return Promise.resolve(); }
+        if(ewStatus==='custom' && isNaN(ewAmount)){ showToast('Enter a custom amount.', 'error'); return Promise.resolve(); }
+        var ewSel = getEntitlementSelection(ewKey);
+        ewSel.waiveStatus = ewStatus; ewSel.waiveReason = ewStatus==='normal' ? '' : ewReason; ewSel.overrideAmount = ewStatus==='custom' ? ewAmount : null;
+        STATE.editingWaiverLine = null;
+        render();
+        return Promise.resolve();
+      }
+      case 'clear-entitlement-date-filter': STATE.entitlementDateFrom=null; STATE.entitlementDateTo=null; render(); return Promise.resolve();
+
+      /* ---- Void + Reissue (both invoice types) ---- */
+      case 'start-void-invoice': STATE.voidingInvoice = {type: btn.dataset.type, id: id}; STATE.voidReasonDraft=''; render(); return Promise.resolve();
+      case 'cancel-void-invoice': STATE.voidingInvoice=null; STATE.voidReasonDraft=''; render(); return Promise.resolve();
+      case 'confirm-void-invoice': {
+        var voidReasonInput = document.getElementById('void-reason-input');
+        var voidReason = voidReasonInput ? voidReasonInput.value : '';
+        if(!STATE.voidingInvoice) return Promise.resolve();
+        return STATE.voidingInvoice.type==='annual' ? voidAnnualInvoice(STATE.voidingInvoice.id, voidReason) : voidEntitlementInvoice(STATE.voidingInvoice.id, voidReason);
+      }
       default: return Promise.resolve();
     }
   }
@@ -2479,7 +3333,11 @@
       case 'reject-reason-select': toggleOtherReasonField(target); return Promise.resolve();
       case 'set-report-month': STATE.reportMonth = parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-report-year': STATE.reportYear = (target.value==='ytd') ? 'ytd' : parseInt(target.value,10); render(); return Promise.resolve();
-      case 'set-invoice-year': STATE.invoiceYear = parseInt(target.value,10); render(); return Promise.resolve();
+      case 'set-invoice-year': STATE.invoiceYear = parseInt(target.value,10); STATE.annualWaivers = {}; STATE.editingWaiverLine = null; render(); return Promise.resolve();
+      case 'toggle-entitlement-check': { var selC = getEntitlementSelection(target.dataset.key); selC.checked = target.checked; render(); return Promise.resolve(); }
+      case 'toggle-entitlement-prorate': { var selP = getEntitlementSelection(target.dataset.key); selP.prorate = target.checked; render(); return Promise.resolve(); }
+      case 'set-entitlement-date-from': STATE.entitlementDateFrom = target.value || null; render(); return Promise.resolve();
+      case 'set-entitlement-date-to': STATE.entitlementDateTo = target.value || null; render(); return Promise.resolve();
       default: return Promise.resolve();
     }
   }
