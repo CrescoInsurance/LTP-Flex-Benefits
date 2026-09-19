@@ -614,6 +614,61 @@
     return items;
   }
 
+  // "Money Holding" / 80% cash-cushion check for New Hire Invoicing --------
+  // The client doesn't need to be re-invoiced the instant a mid-year new
+  // hire or promotion happens, as long as the cash LTP is already holding
+  // on their behalf comfortably covers the company's current total planned
+  // entitlement commitment. This is purely a reminder threshold - it never
+  // blocks issuing an invoice manually at any time.
+
+  // annual_allocation is a live figure: saveAlloc()/confirmPromotion() write
+  // it onto the profile the instant a new hire is added or a promotion is
+  // confirmed, regardless of whether either has actually been invoiced yet.
+  // So simply summing it across every currently active employee already
+  // reflects the full current commitment - mid-year new hires and
+  // promotions both included - with no risk of double-counting once
+  // they're later billed.
+  function totalPlannedEntitlement(){
+    var today = todayStr();
+    return (STATE.profiles||[]).filter(function(p){
+      return p.role==='user' && (!p.effective_date || p.effective_date<=today) && (!p.date_of_termination || p.date_of_termination>=today);
+    }).reduce(function(s,p){ return s+(Number(p.annual_allocation)||0); }, 0);
+  }
+
+  // Everything actually billed to the client to date (Initial, New Hire and
+  // Promotion invoices via entitlement_invoices, plus every issued Annual
+  // Invoice's net payable amount), minus everything already paid out to
+  // employees via approved claims. This assumes every issued invoice gets
+  // paid in full and promptly - there's no "payment received" tracking yet,
+  // so a client that pays late or short will make this read a little
+  // optimistic until that's built.
+  function moneyHoldingBalance(){
+    var billedEnt = (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued'; })
+      .reduce(function(s,i){ return s+(Number(i.total_amount)||0); }, 0);
+    var billedAnnual = (STATE.annualInvoices||[]).filter(function(i){ return i.status==='issued'; })
+      .reduce(function(s,i){ return s+(Number(i.invoice_payable_amount)||0); }, 0);
+    var paidOut = (STATE.claims||[]).filter(function(c){ return c.status==='approved'; })
+      .reduce(function(s,c){ return s+sgdAmountOf(c); }, 0);
+    return billedEnt + billedAnnual - paidOut;
+  }
+
+  // The single source of truth both the New Hire Invoicing badges and its
+  // transparency panel read from, so the figures shown always match the
+  // figures the reminder is actually based on.
+  function entitlementCushionStatus(){
+    var holding = moneyHoldingBalance();
+    var planned = totalPlannedEntitlement();
+    var ratio = planned>0 ? holding/planned : 1;
+    var pendingCount = pendingEntitlementItems().length;
+    var belowThreshold = planned>0 && ratio<0.8;
+    return {
+      holding:holding, planned:planned, ratio:ratio, belowThreshold:belowThreshold,
+      // 0 whenever there's nothing to invoice, even if the cushion is thin -
+      // the reminder is about the backlog below, not the ratio alone.
+      reminderCount: (belowThreshold && pendingCount) ? pendingCount : 0
+    };
+  }
+
   // Applies this item's Prorate checkbox and any Waive/Override choice to
   // get the amount that will actually be billed.
   function finalAmountForSelection(item, sel){
@@ -1522,7 +1577,11 @@
   ========================================================== */
   function renderAdminShell(){
     var pendingCount = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
-    var pendingEntCount = pendingEntitlementItems().length;
+    // The Finance tab badge only nags once the cash cushion actually needs
+    // topping up (entitlementCushionStatus().reminderCount) - not merely
+    // whenever something is technically un-invoiced, which is normal and
+    // fine as long as the float holds.
+    var financeReminderCount = entitlementCushionStatus().reminderCount;
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
       '<div class="tabs">'+
@@ -1531,7 +1590,7 @@
         navTab('staff','Employee Management')+
         navTab('benefits','Benefit Categories')+
         navTab('access','User Access')+
-        navTab('finance','Finance'+(pendingEntCount?' <span class="badge">'+pendingEntCount+'</span>':''))+
+        navTab('finance','Finance'+(financeReminderCount?' <span class="badge">'+financeReminderCount+'</span>':''))+
         navTab('reports','Reports')+
       '</div>'+
       '<div class="content">'+
@@ -1551,13 +1610,13 @@
   // crowding the main nav with three separate top-level tabs.
   function renderAdminFinanceModule(){
     var sub = STATE.financeSubTab || 'annual';
-    var pendingEntCount = pendingEntitlementItems().length;
+    var reminderCount = entitlementCushionStatus().reminderCount;
     var subTabBtn = function(key, label){
       return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
     };
     return '<div class="tabs" style="margin-bottom:16px;">'+
         subTabBtn('annual','Annual Invoice')+
-        subTabBtn('newhire','New Hire Invoicing'+(pendingEntCount?' <span class="badge">'+pendingEntCount+'</span>':''))+
+        subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
         subTabBtn('history','Invoice History')+
       '</div>'+
       (sub==='newhire' ? renderAdminNewHireInvoicing() :
@@ -1965,6 +2024,26 @@
     return row;
   }
 
+  // Money Holding / Total Planned Entitlement transparency panel shown at
+  // the top of New Hire Invoicing, so the 80% figure driving the badge is
+  // never a black box - the admin sees the exact numbers it came from.
+  function renderEntitlementCushionPanel(){
+    var c = entitlementCushionStatus();
+    var pctLabel = c.planned>0 ? Math.round(c.ratio*100)+'%' : '&mdash;';
+    var statusLine = c.planned<=0
+      ? 'No active employees yet - nothing to fund.'
+      : c.belowThreshold
+        ? ('Cushion below 80% - '+c.reminderCount+' item'+(c.reminderCount===1?'':'s')+' below (new hires and/or promotions) should be batched into an invoice to top up the float.')
+        : 'Cushion healthy (80% or above) - any new hires or promotions below can wait; no invoicing required yet.';
+    var statusColor = (c.planned>0 && c.belowThreshold) ? 'var(--danger)' : 'var(--success)';
+    return '<div class="report-summary" style="margin-bottom:8px;">'+
+        'Money Holding: <strong>'+fmtMoney(c.holding)+'</strong> &middot; '+
+        'Total Planned Entitlement: <strong>'+fmtMoney(c.planned)+'</strong> &middot; '+
+        'Cushion: <strong>'+pctLabel+'</strong>'+
+      '</div>'+
+      '<div class="field-hint" style="margin-bottom:14px; color:'+statusColor+';">'+statusLine+'</div>';
+  }
+
   function renderAdminNewHireInvoicing(){
     var allPending = pendingEntitlementItems();
     var from = STATE.entitlementDateFrom, to = STATE.entitlementDateTo;
@@ -1981,6 +2060,7 @@
     return ''+
     '<div class="card">'+
       '<div class="card-title">New Hire Invoicing</div>'+
+      renderEntitlementCushionPanel()+
       '<div class="field-hint" style="margin-bottom:14px;">Every employee who hasn\'t yet been entitlement-invoiced, and every allocation change (promotion) awaiting invoicing - across any date range, not just one month. Tick whoever you\'re billing now; unticked rows just stay here for next time.'+
         (isInitial ? ' <strong>This will be this client\'s Initial Invoice</strong> - it also adds a one-time per-pax headcount establishment charge for every employee included.' : '')+
         ' The <strong>Prorate</strong> checkbox below starts from that employee\'s own setting (Employee Management &rarr; Prorate column) but only affects <em>this invoice</em> - toggling it here is a one-time override for this billing run and never changes what the employee sees in their own wallet.'+
