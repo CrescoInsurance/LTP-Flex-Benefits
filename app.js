@@ -319,7 +319,15 @@
       if(c.status==='approved'){ approvedTotal+=amt; byCategory[c.category].approved+=amt; }
       if(c.status==='pending'){ pendingTotal+=amt; byCategory[c.category].pending+=amt; }
     });
-    var allocation = Number(profile.annual_allocation)||0;
+    // Prorate the wallet cap for an employee's own partial first year, the
+    // same way New Hire Invoicing prorates what the client gets billed --
+    // reuses proratedAllocationForYear() so the two never drift apart.
+    // monthsEmployedInYear() already returns 12 (full year) for any year
+    // after the join year on its own, so this naturally reverts to the full
+    // annual_allocation from next January without any reset job.
+    var allocation = (profile.prorate_entitlement_default!==false)
+      ? proratedAllocationForYear(profile, currentYear)
+      : (Number(profile.annual_allocation)||0);
     var available = allocation - approvedTotal - pendingTotal;
     var utilizationPct = allocation>0 ? Math.min(100, (approvedTotal/allocation)*100) : 0;
     return {allocation:allocation, approvedTotal:approvedTotal, pendingTotal:pendingTotal, available:available, utilizationPct:utilizationPct, byCategory:byCategory, year:currentYear};
@@ -1677,10 +1685,15 @@
         '<label class="mini-field">Full Name<input type="text" name="name" placeholder="e.g. Jane Lim" required /></label>'+
         '<label class="mini-field">Work Email<input type="email" name="email" placeholder="jane@company.com" required /></label>'+
         '<label class="mini-field">Date of Employment<input type="date" name="dateOfEmployment" style="width:160px" required /></label>'+
-        '<label class="mini-field">Effective Date<input type="date" name="effectiveDate" style="width:160px" required /></label>'+
+        '<label class="mini-field">Effective Date<input type="date" name="effectiveDate" id="add-emp-effective-date" style="width:160px" required oninput="window.updateAddEmployeeProratePreview()" /></label>'+
         '<label class="mini-field">PayNow Mobile Number<input type="tel" name="paynowMobile" placeholder="e.g. 91234567" style="width:160px" required /></label>'+
         '<label class="mini-field">NRIC<input type="text" name="nric" placeholder="e.g. S1234567A" style="width:140px" /></label>'+
-        '<label class="mini-field">Entitlement (SGD)<input type="number" name="annualAllocation" value="1000" min="0" step="1" style="width:140px" required /></label>'+
+        '<label class="mini-field">Entitlement (SGD)<input type="number" name="annualAllocation" id="add-emp-allocation" value="1000" min="0" step="1" style="width:140px" required oninput="window.updateAddEmployeeProratePreview()" /></label>'+
+        '<label class="mini-field" style="flex-basis:100%;flex-direction:row;align-items:center;gap:6px;">'+
+          '<input type="checkbox" name="prorateEntitlement" id="add-emp-prorate" checked style="width:auto;" onchange="window.updateAddEmployeeProratePreview()" /> '+
+          '<span>Prorate for partial first year</span>'+
+        '</label>'+
+        '<div class="field-hint" id="add-emp-prorate-preview" style="flex-basis:100%;"></div>'+
         (mode==='family' ? (
           '<div class="field-hint" style="flex-basis:100%;margin-top:4px;">Family members (share this employee\'s entitlement - no separate login or email)</div>'+
           '<div id="family-draft-rows" style="flex-basis:100%;">'+familyDraftRowHtml()+'</div>'+
@@ -3001,6 +3014,7 @@
     var nric = form.nric.value.trim();
     var allocRaw = form.annualAllocation.value;
     var alloc = parseFloat(allocRaw);
+    var prorateEntitlement = !!(form.prorateEntitlement && form.prorateEntitlement.checked);
     if(!name || !email || !dateOfEmployment || !effectiveDate || !paynowMobile || allocRaw==='' || isNaN(alloc)){
       showToast('Please complete all fields before adding the employee.', 'error');
       return Promise.resolve();
@@ -3025,7 +3039,7 @@
     }
 
     return supabase.from('invites').upsert(
-      {email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfEmployment, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric: nric || null, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false},
+      {email:email, name:name, role:'user', annual_allocation:alloc, date_of_joining:dateOfEmployment, paynow_mobile:paynowMobile, effective_date:effectiveDate, nric: nric || null, welcome_email_sent:false, invited_by:STATE.session.user.id, used:false, prorate_entitlement_default:prorateEntitlement},
       {onConflict:'email'}
     ).then(function(res){
       if(res.error) throw new Error('Could not add employee: '+res.error.message);
@@ -3634,6 +3648,42 @@
      BOOTSTRAP
   ========================================================== */
   window.closeReceiptModal = function(){ STATE.modal=null; render(); };
+
+  // Live preview under the Add Employee form's new "Prorate" checkbox -- a
+  // direct DOM write (not STATE/render()) so typing in the Entitlement or
+  // Effective Date fields doesn't blow away whatever else is mid-edit in the
+  // form. Reuses the exact same whole-month convention as
+  // monthsEmployedInYear()/proratedAllocationForYear() (the functions the
+  // New Hire Invoicing tab and the wallet calculation both rely on), so this
+  // preview always matches what the employee will actually see.
+  window.updateAddEmployeeProratePreview = function(){
+    var hint = document.getElementById('add-emp-prorate-preview');
+    if(!hint) return;
+    var dateEl = document.getElementById('add-emp-effective-date');
+    var allocEl = document.getElementById('add-emp-allocation');
+    var checkEl = document.getElementById('add-emp-prorate');
+    var effectiveDate = dateEl ? dateEl.value : '';
+    var fullAlloc = allocEl ? parseFloat(allocEl.value) : NaN;
+    if(!effectiveDate || isNaN(fullAlloc)){ hint.textContent = ''; return; }
+    if(checkEl && !checkEl.checked){
+      hint.textContent = 'Prorate off - the wallet will show the full '+fmtMoney(fullAlloc)+' right away.';
+      return;
+    }
+    var currentYear = new Date().getFullYear();
+    var effYear = Number(effectiveDate.slice(0,4));
+    var effMonth = Number(effectiveDate.slice(5,7));
+    if(effYear > currentYear){
+      hint.textContent = 'Effective date is in a future year - the full '+fmtMoney(fullAlloc)+' will apply once it arrives.';
+      return;
+    }
+    if(effYear < currentYear){
+      hint.textContent = 'Effective date is in a past year - the full '+fmtMoney(fullAlloc)+' applies for '+currentYear+'.';
+      return;
+    }
+    var months = 12 - effMonth + 1;
+    var prorated = fullAlloc * (months/12);
+    hint.textContent = 'Wallet will show '+fmtMoney(prorated)+' for the rest of '+currentYear+' ('+months+' of 12 months); the full '+fmtMoney(fullAlloc)+' applies from January '+(currentYear+1)+'.';
+  };
 
   var app = document.getElementById('app');
   app.addEventListener('click', function(e){ handleClick(e).catch(function(err){ console.error(err); }); });
