@@ -1601,9 +1601,17 @@
   function renderAdminStaff(){
     var roleFilter = STATE.staffRoleFilter || 'all';
     var visibleProfiles = STATE.profiles.filter(function(p){ return roleFilter==='all' || p.role===roleFilter; });
-    var COL_COUNT = 11;
+    var COL_COUNT = 12;
     var staffRows = visibleProfiles.map(function(p){
       var allocCell;
+      // Whether THIS employee's own wallet gets prorated for a partial
+      // first year (set at Add Employee time) - editable here too, so it's
+      // not stuck as a one-time decision. This is the standing setting the
+      // wallet calculation (computeWallet) always follows; it's separate
+      // from the one-off "Prorate" override on a specific New Hire
+      // Invoicing run, which only affects billing and never this.
+      var prorateOn = p.prorate_entitlement_default!==false;
+      var prorateCell = '<label class="tiny"><input type="checkbox" data-action="toggle-prorate-default" data-id="'+p.id+'" '+(prorateOn?'checked':'')+'/> '+(prorateOn?'On':'Off')+'</label>';
       if(STATE.promotingEmployeeId===p.id){
         var promoDelta = (STATE.promotionDraftAllocation||0) - (Number(p.annual_allocation)||0);
         allocCell = '<div style="min-width:260px;">'+
@@ -1640,6 +1648,7 @@
         '<td><span class="role-chip">'+roleLabel+'</span></td>'+
         '<td>'+familyCell+'</td>'+
         '<td>'+allocCell+'</td>'+
+        '<td>'+prorateCell+'</td>'+
         '<td>'+fmtDate(p.date_of_joining)+'</td>'+
         '<td>'+(p.effective_date ? fmtDate(p.effective_date) : '-')+'</td>'+
         '<td>'+terminationCell+'</td>'+
@@ -1718,8 +1727,9 @@
     '<div class="card"><div class="card-title">Employee Directory</div>'+
       '<div class="filter-row">'+staffFilters.map(function(f){ return '<button class="chip-filter '+(roleFilter===f.key?'active':'')+'" data-action="filter-staff" data-filter="'+f.key+'">'+f.label+'</button>'; }).join('')+'</div>'+
       '<div class="table-wrap"><table class="data-table">'+
-      '<thead><tr><th>Name</th><th>Email</th><th>NRIC</th><th>Role</th><th>Family</th><th>Annual Allocation</th><th>Date of Employment</th><th>Effective Date</th><th>Date of Termination</th><th>Status</th><th>Actions</th></tr></thead>'+
+      '<thead><tr><th>Name</th><th>Email</th><th>NRIC</th><th>Role</th><th>Family</th><th>Annual Allocation</th><th>Prorate</th><th>Date of Employment</th><th>Effective Date</th><th>Date of Termination</th><th>Status</th><th>Actions</th></tr></thead>'+
       '<tbody>'+staffRows+'</tbody></table></div>'+
+      '<div class="field-hint">The <strong>Prorate</strong> column is this employee\'s standing setting - On means their own wallet shows a reduced amount for a partial first year (matching what New Hire Invoicing normally bills for them); Off means their wallet always shows the full entitlement. It reverts to having no effect automatically from the January after they join. Changing it here does not touch any invoice already issued or in progress.</div>'+
       '<div class="field-hint">Deleting an employee removes their account, all their claim history, and their notifications - permanently, and this cannot be undone. Their login itself still technically exists in Supabase until removed from the dashboard\'s Authentication &gt; Users page too, but they won\'t be able to do anything with it here once deleted.</div>'+
     '</div>';
   }
@@ -1953,6 +1963,7 @@
       '<div class="card-title">New Hire Invoicing</div>'+
       '<div class="field-hint" style="margin-bottom:14px;">Every employee who hasn\'t yet been entitlement-invoiced, and every allocation change (promotion) awaiting invoicing - across any date range, not just one month. Tick whoever you\'re billing now; unticked rows just stay here for next time.'+
         (isInitial ? ' <strong>This will be this client\'s Initial Invoice</strong> - it also adds a one-time per-pax headcount establishment charge for every employee included.' : '')+
+        ' The <strong>Prorate</strong> checkbox below starts from that employee\'s own setting (Employee Management &rarr; Prorate column) but only affects <em>this invoice</em> - toggling it here is a one-time override for this billing run and never changes what the employee sees in their own wallet.'+
       '</div>'+
       '<div class="report-controls" style="margin-bottom:14px;">'+
         '<label class="mini-field">From<input type="date" data-action="set-entitlement-date-from" value="'+(from||'')+'"/></label>'+
@@ -3212,6 +3223,19 @@
     }).then(function(){ render(); });
   }
 
+  // Flips an employee's own standing Prorate setting (computeWallet reads
+  // this directly) after they've already been added - previously this could
+  // only be set once, at Add Employee time. Deliberately does NOT touch
+  // STATE.entitlementSelections, so any New Hire Invoicing row already
+  // being prepared for this employee keeps whatever the admin chose there.
+  function toggleProrateDefault(id, checked){
+    return supabase.from('profiles').update({prorate_entitlement_default:checked}).eq('id', id).then(function(res){
+      if(res.error){ showToast('Could not update Prorate setting: '+res.error.message, 'error'); render(); return; }
+      showToast('Prorate setting updated for this employee\'s wallet.', 'success');
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
   // Changing an existing employee's allocation to a DIFFERENT figure is a
   // mid-year entitlement change (a promotion, or a correction) - rather than
   // saving it straight away, this opens an inline "give it an effective
@@ -3539,6 +3563,7 @@
     if(!action) return Promise.resolve();
     switch(action){
       case 'change-role': return changeRole(target.dataset.id, target.value);
+      case 'toggle-prorate-default': return toggleProrateDefault(target.dataset.id, target.checked);
       case 'reject-reason-select': toggleOtherReasonField(target); return Promise.resolve();
       case 'set-report-month': STATE.reportMonth = parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-report-year': STATE.reportYear = (target.value==='ytd') ? 'ytd' : parseInt(target.value,10); render(); return Promise.resolve();
