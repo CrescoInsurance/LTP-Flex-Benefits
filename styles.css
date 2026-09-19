@@ -119,6 +119,14 @@
   .search-input:focus{outline:2px solid var(--primary);outline-offset:1px;}
 
   /* ---------- Buttons ---------- */
+  /* Every clickable button/link below gets user-select:none (plus the
+     -webkit- prefixes Safari/trackpads care about). Without this, a firm
+     trackpad press (macOS "Force Click") can select the button's text or
+     trigger the "Look Up" dictionary popup instead of registering as a
+     click -- the click never reaches the app at all. Non-selectable text
+     removes what Look Up/selection needs to latch onto, so a heavy press
+     just falls through to an ordinary click instead. */
+  button,.btn,.link-btn{-webkit-user-select:none;-moz-user-select:none;user-select:none;-webkit-touch-callout:none;}
   .btn{border:none;border-radius:var(--radius-sm);padding:10px 16px;font-size:13.5px;font-weight:700;cursor:pointer;transition:filter .15s ease;}
   .btn:hover{filter:brightness(1.06);}
   .btn:active{filter:brightness(.95);}
