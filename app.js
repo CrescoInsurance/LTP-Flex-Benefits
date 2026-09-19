@@ -66,6 +66,7 @@
     rejectedSortDirection: 'desc',
     reportMonth: null, reportYear: null,
     invoiceYear: null,
+    financeSubTab: null, // 'annual' | 'newhire' | 'history' - sub-tab within the Finance module
     editingInvoiceRate: false,
     editingClientName: false,
     editingWaiverLine: null, // 'headcountAdjustment' | 'baseHeadcountCharge' | null
@@ -375,6 +376,21 @@
     });
   }
 
+  // Auto-linking for Void + Reissue: finds the invoice a about-to-be-issued
+  // invoice should record as superseding, in a given list (annualInvoices or
+  // entitlementInvoices) - the most recently voided one matching `matchFn`
+  // that no other invoice has already claimed via supersedes_invoice_id.
+  // "Most recently voided and not yet claimed" naturally follows a
+  // void -> reissue -> void -> reissue chain correctly, always picking up
+  // where the last reissue left off.
+  function findUnsupersededVoid(list, matchFn){
+    var superseded = {};
+    (list||[]).forEach(function(x){ if(x.supersedes_invoice_id){ superseded[x.supersedes_invoice_id]=true; } });
+    var candidates = (list||[]).filter(function(x){ return x.status==='voided' && matchFn(x) && !superseded[x.id]; });
+    candidates.sort(function(a,b){ return (b.voided_at||'').localeCompare(a.voided_at||''); });
+    return candidates[0] || null;
+  }
+
   function buildInvoiceYearOptions(){
     var now = new Date();
     var years = {};
@@ -575,12 +591,16 @@
   function issueEntitlementInvoice(){
     var preview = computeEntitlementInvoicePreview();
     if(!preview.lines.length){ showToast('Select at least one employee or promotion to invoice.', 'error'); return Promise.resolve(); }
+    // Auto-link Void + Reissue: if there's a voided entitlement invoice with
+    // no successor yet, this new one is presumed to be its correction.
+    var precedingVoided = findUnsupersededVoid(STATE.entitlementInvoices, function(){ return true; });
     return nextInvoiceNumber().then(function(invoiceNumber){
       var header = {
         invoice_number: invoiceNumber, invoice_type: preview.invoiceType, status:'issued',
         issued_by: STATE.session.user.id, entitlement_total: preview.entitlementTotal,
         per_pax_rate: preview.invoiceType==='initial' ? preview.rate : null,
-        per_pax_total: preview.perPaxTotal, total_amount: preview.totalAmount
+        per_pax_total: preview.perPaxTotal, total_amount: preview.totalAmount,
+        supersedes_invoice_id: precedingVoided ? precedingVoided.id : null
       };
       return supabase.from('entitlement_invoices').insert([header]).select().then(function(res){
         if(res.error || !res.data || !res.data[0]){ showToast('Could not create invoice: '+(res.error&&res.error.message), 'error'); throw res.error; }
@@ -606,8 +626,8 @@
           });
           return Promise.all(promoUpdates).then(function(){
             preview.lines.forEach(function(l){ delete STATE.entitlementSelections[l.item.key]; });
-            showToast('Invoice '+invoiceNumber+' issued.', 'success');
-            exportEntitlementInvoicePDF({invoiceRow:invoiceRow, items:savedItems});
+            showToast('Invoice '+invoiceNumber+' issued.'+(precedingVoided?(' Supersedes '+precedingVoided.invoice_number+'.'):''), 'success');
+            exportEntitlementInvoicePDF({invoiceRow:invoiceRow, items:savedItems, supersedesNumber: precedingVoided?precedingVoided.invoice_number:null});
             return loadAppData();
           });
         });
@@ -836,10 +856,14 @@
     var year = getSelectedInvoiceYear();
     var already = STATE.annualInvoices.filter(function(a){ return a.year===year && a.status==='issued'; })[0];
     if(already){ showToast('An Annual Invoice for '+year+' has already been issued ('+already.invoice_number+'). Void it first to reissue.', 'error'); return Promise.resolve(); }
+    // Auto-link Void + Reissue: if this year has a voided Annual Invoice
+    // with no successor yet, this new one is presumed to be its correction.
+    var precedingVoided = findUnsupersededVoid(STATE.annualInvoices, function(a){ return a.year===year; });
     var inv = applyAnnualWaivers(computeAnnualInvoice(year));
     return nextInvoiceNumber().then(function(invoiceNumber){
       var row = {
         invoice_number: invoiceNumber, year: year, status:'issued', issued_by: STATE.session.user.id,
+        supersedes_invoice_id: precedingVoided ? precedingVoided.id : null,
         rate_per_head: inv.rate,
         headcount_adjustment_amount: inv.adjustmentAmount,
         headcount_adjustment_waived: !!(inv.adjustmentWaiver && inv.adjustmentWaiver.status==='waived'),
@@ -861,8 +885,8 @@
         if(res.error || !res.data || !res.data[0]){ showToast('Could not issue Annual Invoice: '+(res.error&&res.error.message), 'error'); throw res.error; }
         var savedRow = res.data[0];
         STATE.annualWaivers = {};
-        showToast('Annual Invoice '+invoiceNumber+' issued.', 'success');
-        exportInvoicePDF({inv: savedRow.snapshot_json, year: year, invoiceNumber: invoiceNumber, invoiceDate: '2 Jan '+(year+1), preview:false});
+        showToast('Annual Invoice '+invoiceNumber+' issued.'+(precedingVoided?(' Supersedes '+precedingVoided.invoice_number+'.'):''), 'success');
+        exportInvoicePDF({inv: savedRow.snapshot_json, year: year, invoiceNumber: invoiceNumber, invoiceDate: '2 Jan '+(year+1), preview:false, supersedesNumber: precedingVoided?precedingVoided.invoice_number:null});
         return loadAppData();
       });
     }).then(function(){ render(); });
@@ -1376,6 +1400,7 @@
   ========================================================== */
   function renderAdminShell(){
     var pendingCount = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
+    var pendingEntCount = pendingEntitlementItems().length;
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
       '<div class="tabs">'+
@@ -1384,9 +1409,7 @@
         navTab('staff','Employee Management')+
         navTab('benefits','Benefit Categories')+
         navTab('access','User Access')+
-        navTab('finance','Finance')+
-        navTab('newhire','New Hire Invoicing'+(pendingEntitlementItems().length?' <span class="badge">'+pendingEntitlementItems().length+'</span>':''))+
-        navTab('invoicehistory','Invoice History')+
+        navTab('finance','Finance'+(pendingEntCount?' <span class="badge">'+pendingEntCount+'</span>':''))+
         navTab('reports','Reports')+
       '</div>'+
       '<div class="content">'+
@@ -1394,12 +1417,30 @@
          tab==='staff' ? renderAdminStaff() :
          tab==='benefits' ? renderAdminBenefits() :
          tab==='access' ? renderAdminAccess() :
-         tab==='finance' ? renderAdminFinance() :
-         tab==='newhire' ? renderAdminNewHireInvoicing() :
-         tab==='invoicehistory' ? renderAdminInvoiceHistory() :
+         tab==='finance' ? renderAdminFinanceModule() :
          tab==='reports' ? renderAdminReports() :
          renderAdminApprovals())+
       '</div></div>';
+  }
+
+  // Finance module: Annual Invoice, New Hire Invoicing and Invoice History
+  // are all facets of the same billing workflow, so they live under one
+  // top-level "Finance" tab with their own sub-tab row, rather than
+  // crowding the main nav with three separate top-level tabs.
+  function renderAdminFinanceModule(){
+    var sub = STATE.financeSubTab || 'annual';
+    var pendingEntCount = pendingEntitlementItems().length;
+    var subTabBtn = function(key, label){
+      return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
+    };
+    return '<div class="tabs" style="margin-bottom:16px;">'+
+        subTabBtn('annual','Annual Invoice')+
+        subTabBtn('newhire','New Hire Invoicing'+(pendingEntCount?' <span class="badge">'+pendingEntCount+'</span>':''))+
+        subTabBtn('history','Invoice History')+
+      '</div>'+
+      (sub==='newhire' ? renderAdminNewHireInvoicing() :
+       sub==='history' ? renderAdminInvoiceHistory() :
+       renderAdminFinance());
   }
 
   function renderAdminApprovals(){
@@ -1661,6 +1702,7 @@
          '<button class="btn btn-sm btn-primary" data-action="issue-annual-invoice">Issue Invoice</button>');
 
     var voidPanel = (STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===(issuedAnnual&&issuedAnnual.id)) ? renderVoidPanel() : '';
+    var precedingVoidedAnnual = isIssuedView ? null : findUnsupersededVoid(STATE.annualInvoices, function(a){ return a.year===year; });
 
     return ''+
     '<div class="card">'+
@@ -1673,6 +1715,7 @@
       '</div>'+
       '<div class="report-summary" style="margin-bottom:16px;">Period: 1 Jan '+year+' - 31 Dec '+year+' &middot; Invoice date '+invoiceDate+' &middot; '+invoiceNoLabel+' &middot; '+rateCell+
         (isIssuedView?'':' <span class="tiny muted">&middot; Preview only - nothing is saved until you Issue</span>')+
+        (precedingVoidedAnnual ? (' <span class="tiny" style="color:var(--accent-dark);">&middot; Issuing now will supersede voided invoice '+escapeHtml(precedingVoidedAnnual.invoice_number)+'</span>') : '')+
       '</div>'+
       voidPanel+
       '<div class="grid-cards">'+
@@ -1792,6 +1835,7 @@
     var preview = computeEntitlementInvoicePreview();
     var isInitial = preview.invoiceType==='initial';
     var rows = pending.map(entitlementItemRowHtml).join('');
+    var precedingVoidedEnt = findUnsupersededVoid(STATE.entitlementInvoices, function(){ return true; });
 
     return ''+
     '<div class="card">'+
@@ -1814,6 +1858,7 @@
       '<div class="report-summary" style="margin-top:16px;">'+
         (isInitial ? ('Per-Pax Establishment Charge: '+preview.headcountForPax+' &times; '+fmtMoney(preview.rate)+' = '+fmtMoney(preview.perPaxTotal)+' &middot; ') : '')+
         'Entitlement Total: '+fmtMoney(preview.entitlementTotal)+' &middot; <strong>Total Amount: '+fmtMoney(preview.totalAmount)+'</strong>'+
+        (precedingVoidedEnt ? (' <span class="tiny" style="color:var(--accent-dark);">&middot; Issuing now will supersede voided invoice '+escapeHtml(precedingVoidedEnt.invoice_number)+'</span>') : '')+
       '</div>'+
       '<div style="margin-top:12px;">'+
         '<button class="btn btn-ghost btn-sm" data-action="preview-entitlement-invoice">Preview PDF</button> '+
@@ -1830,14 +1875,18 @@
       var typeLabel = inv.invoice_type==='initial' ? 'Initial Roster Invoice' : 'New Hire / Promotion Invoice';
       var statusHtml = inv.status==='voided' ? '<span class="tiny" style="color:var(--danger);">Voided'+(inv.voided_reason?(' - '+escapeHtml(inv.voided_reason)):'')+'</span>' : '<span class="tiny" style="color:var(--success);">Issued</span>';
       var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="entitlement" data-id="'+inv.id+'">Void</button>' : '';
-      return '<tr><td>'+escapeHtml(inv.invoice_number)+'</td><td>'+typeLabel+'</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>'+itemCount+'</td><td>'+fmtMoney(inv.total_amount)+'</td><td>'+statusHtml+'</td>'+
+      var supersedesRow = inv.supersedes_invoice_id ? STATE.entitlementInvoices.filter(function(i){ return i.id===inv.supersedes_invoice_id; })[0] : null;
+      var numberCell = escapeHtml(inv.invoice_number)+(supersedesRow ? '<div class="tiny muted">supersedes '+escapeHtml(supersedesRow.invoice_number)+'</div>' : '');
+      return '<tr><td>'+numberCell+'</td><td>'+typeLabel+'</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>'+itemCount+'</td><td>'+fmtMoney(inv.total_amount)+'</td><td>'+statusHtml+'</td>'+
         '<td><button class="link-btn tiny" data-action="download-entitlement-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
         ((STATE.voidingInvoice && STATE.voidingInvoice.type==='entitlement' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
     }).join('');
     var annRows = STATE.annualInvoices.slice().sort(function(a,b){ return (b.issued_at||'').localeCompare(a.issued_at||''); }).map(function(inv){
       var statusHtml = inv.status==='voided' ? '<span class="tiny" style="color:var(--danger);">Voided'+(inv.voided_reason?(' - '+escapeHtml(inv.voided_reason)):'')+'</span>' : '<span class="tiny" style="color:var(--success);">Issued</span>';
       var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="annual" data-id="'+inv.id+'">Void</button>' : '';
-      return '<tr><td>'+escapeHtml(inv.invoice_number)+'</td><td>Annual Invoice ('+inv.year+')</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>&mdash;</td><td>'+fmtMoney(inv.invoice_payable_amount)+'</td><td>'+statusHtml+'</td>'+
+      var annSupersedesRow = inv.supersedes_invoice_id ? STATE.annualInvoices.filter(function(a){ return a.id===inv.supersedes_invoice_id; })[0] : null;
+      var annNumberCell = escapeHtml(inv.invoice_number)+(annSupersedesRow ? '<div class="tiny muted">supersedes '+escapeHtml(annSupersedesRow.invoice_number)+'</div>' : '');
+      return '<tr><td>'+annNumberCell+'</td><td>Annual Invoice ('+inv.year+')</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>&mdash;</td><td>'+fmtMoney(inv.invoice_payable_amount)+'</td><td>'+statusHtml+'</td>'+
         '<td><button class="link-btn tiny" data-action="download-annual-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
         ((STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
     }).join('');
@@ -2231,9 +2280,11 @@
       doc.text('Invoice Date: '+invoiceDate, margin, 46);
       if(opts.preview){ doc.setTextColor(200,120,0); doc.text('Invoice No: '+invoiceNumber, margin, 52); doc.setTextColor(40,40,40); }
       else { doc.text('Invoice No: '+invoiceNumber, margin, 52); }
-      doc.text('Period Covered: 1 Jan '+year+' - 31 Dec '+year, margin, 58);
+      var headerY = 58;
+      if(opts.supersedesNumber){ doc.setTextColor(120,120,120); doc.text('Supersedes voided invoice: '+opts.supersedesNumber, margin, headerY); doc.setTextColor(40,40,40); headerY += 6; }
+      doc.text('Period Covered: 1 Jan '+year+' - 31 Dec '+year, margin, headerY);
 
-      var cy = 68;
+      var cy = headerY+10;
       doc.setFontSize(13); doc.setTextColor(brandColor[0],brandColor[1],brandColor[2]);
       doc.text('Headcount Adjustment (True-Up for '+year+')', margin, cy);
       doc.autoTable({
@@ -2458,7 +2509,9 @@
       doc.text('Invoice Date: '+invoiceDate, margin, iy);
       if(isPreview){ doc.setTextColor(200,120,0); doc.text('Invoice No: '+invoiceNumber, margin, iy+6); doc.setTextColor(40,40,40); }
       else { doc.text('Invoice No: '+invoiceNumber, margin, iy+6); }
-      doc.text('Bill To: '+getClientCompanyName(), margin, iy+12);
+      var byLineY = iy+12;
+      doc.text('Bill To: '+getClientCompanyName(), margin, byLineY);
+      if(opts.supersedesNumber){ byLineY += 6; doc.setTextColor(120,120,120); doc.text('Supersedes voided invoice: '+opts.supersedesNumber, margin, byLineY); doc.setTextColor(40,40,40); }
 
       var sectionHeading = function(text, y){
         doc.setFillColor(accent[0],accent[1],accent[2]);
@@ -2467,7 +2520,7 @@
         doc.text(text, margin+5, y);
       };
 
-      var cy = iy+24;
+      var cy = byLineY+12;
       sectionHeading((isInitial?'Initial Roster - ':'')+'Entitlement Charges', cy);
       cy += 5;
       var rows = lines.map(function(l){
@@ -3223,17 +3276,20 @@
       case 'filter-staff': STATE.staffRoleFilter=btn.dataset.filter; render(); return Promise.resolve();
       case 'confirm-promotion': return confirmPromotion(id);
       case 'cancel-promotion': cancelPromotion(); return Promise.resolve();
+      case 'finance-subtab': STATE.financeSubTab = btn.dataset.subtab; render(); return Promise.resolve();
 
       /* ---- Annual Invoice: Preview / Issue / Download / waivers ---- */
       case 'preview-annual-invoice': {
         var pyear = getSelectedInvoiceYear();
-        exportInvoicePDF({inv: applyAnnualWaivers(computeAnnualInvoice(pyear)), year: pyear, invoiceDate: '2 Jan '+(pyear+1), preview:true});
+        var pPrecedingVoided = findUnsupersededVoid(STATE.annualInvoices, function(a){ return a.year===pyear; });
+        exportInvoicePDF({inv: applyAnnualWaivers(computeAnnualInvoice(pyear)), year: pyear, invoiceDate: '2 Jan '+(pyear+1), preview:true, supersedesNumber: pPrecedingVoided?pPrecedingVoided.invoice_number:null});
         return Promise.resolve();
       }
       case 'issue-annual-invoice': return issueAnnualInvoice();
       case 'download-annual-invoice': {
         var annRow = STATE.annualInvoices.filter(function(a){ return a.id===id; })[0];
-        if(annRow) exportInvoicePDF({inv: annRow.snapshot_json, year: annRow.year, invoiceNumber: annRow.invoice_number, invoiceDate:'2 Jan '+(annRow.year+1), preview:false});
+        var annSupersedesRow = annRow && annRow.supersedes_invoice_id ? STATE.annualInvoices.filter(function(a){ return a.id===annRow.supersedes_invoice_id; })[0] : null;
+        if(annRow) exportInvoicePDF({inv: annRow.snapshot_json, year: annRow.year, invoiceNumber: annRow.invoice_number, invoiceDate:'2 Jan '+(annRow.year+1), preview:false, supersedesNumber: annSupersedesRow?annSupersedesRow.invoice_number:null});
         return Promise.resolve();
       }
       case 'toggle-waiver-editor': STATE.editingWaiverLine = (STATE.editingWaiverLine===btn.dataset.line ? null : btn.dataset.line); render(); return Promise.resolve();
@@ -3255,12 +3311,17 @@
       }
 
       /* ---- Entitlement (New Hire / Promotion) Invoicing ---- */
-      case 'preview-entitlement-invoice': exportEntitlementInvoicePDF({preview:true, previewData: computeEntitlementInvoicePreview()}); return Promise.resolve();
+      case 'preview-entitlement-invoice': {
+        var entPrecedingVoided = findUnsupersededVoid(STATE.entitlementInvoices, function(){ return true; });
+        exportEntitlementInvoicePDF({preview:true, previewData: computeEntitlementInvoicePreview(), supersedesNumber: entPrecedingVoided?entPrecedingVoided.invoice_number:null});
+        return Promise.resolve();
+      }
       case 'issue-entitlement-invoice': return issueEntitlementInvoice();
       case 'download-entitlement-invoice': {
         var entRow = STATE.entitlementInvoices.filter(function(i){ return i.id===id; })[0];
         var entItems = STATE.entitlementInvoiceItems.filter(function(i){ return i.invoice_id===id; });
-        if(entRow) exportEntitlementInvoicePDF({invoiceRow:entRow, items:entItems});
+        var entSupersedesRow = entRow && entRow.supersedes_invoice_id ? STATE.entitlementInvoices.filter(function(i){ return i.id===entRow.supersedes_invoice_id; })[0] : null;
+        if(entRow) exportEntitlementInvoicePDF({invoiceRow:entRow, items:entItems, supersedesNumber: entSupersedesRow?entSupersedesRow.invoice_number:null});
         return Promise.resolve();
       }
       case 'toggle-entitlement-waiver': STATE.editingWaiverLine = (STATE.editingWaiverLine===btn.dataset.key ? null : btn.dataset.key); render(); return Promise.resolve();
