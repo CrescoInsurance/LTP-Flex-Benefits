@@ -1348,7 +1348,6 @@
           '<div class="dropzone-hint">Choose a file, or drag and drop it here</div>'+
         '</div>'+
         (STATE.claimFormError ? '<div class="field-error">'+escapeHtml(STATE.claimFormError)+'</div>' : '')+
-        '<div class="field-hint">Only Gym membership, Health screening, Optical, Dental and Leisure travel are claimable. Other expenses, including petrol, cannot be reimbursed through this wallet.</div>'+
         '<button type="submit" class="btn btn-primary">Submit Claim</button>'+
       '</form></div>';
   }
