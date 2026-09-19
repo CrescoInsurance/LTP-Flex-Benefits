@@ -53,7 +53,12 @@
   .field-error{background:var(--danger-bg);color:var(--danger);padding:8px 10px;border-radius:var(--radius-sm);font-size:12.5px;font-weight:600;}
 
   /* ---------- Shell / Topbar / Tabs ---------- */
-  .shell{max-width:1080px;margin:0 auto;padding:0 20px 60px;}
+  /* Widened from 1080px so wide tables (Employee Directory's 12 columns,
+     in particular) have a real shot at fitting without horizontal
+     scrolling on a typical laptop/desktop screen. The 720px/480px
+     breakpoints below still shrink everything down for phones, so this
+     only ever adds room on screens that already have it to spare. */
+  .shell{max-width:1320px;margin:0 auto;padding:0 20px 60px;}
   .topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 0;flex-wrap:wrap;gap:10px;}
   .brand-mini{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;color:var(--primary-dark);}
   .brand-text{display:flex;flex-direction:column;line-height:1.3;gap:1px;}
@@ -143,9 +148,15 @@
 
   /* ---------- Tables ---------- */
   .table-wrap{overflow-x:auto;}
-  .data-table{width:100%;border-collapse:collapse;font-size:13px;}
-  .data-table th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-muted);padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap;}
-  .data-table td{padding:10px;border-bottom:1px solid var(--border);vertical-align:middle;}
+  /* Tightened padding/font a notch (was 13px / 8-10px) so wider tables -
+     Employee Directory's 12 columns especially - need less horizontal
+     room to lay out without truncating anything, working together with
+     the widened .shell above to avoid horizontal scrolling on most
+     screens. table-wrap above still scrolls it gracefully on anything
+     narrower, phones included. */
+  .data-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  .data-table th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-muted);padding:7px 8px;border-bottom:1px solid var(--border);white-space:nowrap;}
+  .data-table td{padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:middle;}
   .data-table tr:last-child td{border-bottom:none;}
   .actions-cell{white-space:nowrap;}
   .actions-cell .btn{margin-right:6px;}
