@@ -556,7 +556,16 @@
 
   function getEntitlementSelection(key, defaultProrate){
     if(!STATE.entitlementSelections[key]){
-      STATE.entitlementSelections[key] = {checked:false, prorate: defaultProrate!==false, waiveStatus:'normal', waiveReason:'', overrideAmount:null};
+      STATE.entitlementSelections[key] = {checked:false, prorate: defaultProrate!==false, prorateManual:false, waiveStatus:'normal', waiveReason:'', overrideAmount:null};
+    } else if(!STATE.entitlementSelections[key].prorateManual && defaultProrate!==undefined){
+      // Keep this row's Prorate checkbox following the employee's standing
+      // setting (Employee Management -> Prorate column) until the admin
+      // explicitly overrides it right here on this row - so changing that
+      // standing setting shows up in the Amount immediately, the next time
+      // this row renders, rather than needing a full page refresh. Once
+      // the admin does touch this row's own checkbox (below), it's treated
+      // as a deliberate one-time override and stops auto-following.
+      STATE.entitlementSelections[key].prorate = defaultProrate!==false;
     }
     return STATE.entitlementSelections[key];
   }
@@ -3236,9 +3245,12 @@
 
   // Flips an employee's own standing Prorate setting (computeWallet reads
   // this directly) after they've already been added - previously this could
-  // only be set once, at Add Employee time. Deliberately does NOT touch
-  // STATE.entitlementSelections, so any New Hire Invoicing row already
-  // being prepared for this employee keeps whatever the admin chose there.
+  // only be set once, at Add Employee time. Does not touch
+  // STATE.entitlementSelections directly - getEntitlementSelection() itself
+  // keeps any not-yet-manually-overridden New Hire Invoicing row following
+  // this setting live, so the Amount there updates the next time that row
+  // renders (e.g. switching tabs) without needing a page refresh. A row the
+  // admin has already hand-toggled keeps whatever they chose there.
   function toggleProrateDefault(id, checked){
     return supabase.from('profiles').update({prorate_entitlement_default:checked}).eq('id', id).then(function(res){
       if(res.error){ showToast('Could not update Prorate setting: '+res.error.message, 'error'); render(); return; }
@@ -3592,7 +3604,7 @@
       case 'set-report-year': STATE.reportYear = (target.value==='ytd') ? 'ytd' : parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-invoice-year': STATE.invoiceYear = parseInt(target.value,10); STATE.annualWaivers = {}; STATE.editingWaiverLine = null; render(); return Promise.resolve();
       case 'toggle-entitlement-check': { var selC = getEntitlementSelection(target.dataset.key); selC.checked = target.checked; render(); return Promise.resolve(); }
-      case 'toggle-entitlement-prorate': { var selP = getEntitlementSelection(target.dataset.key); selP.prorate = target.checked; render(); return Promise.resolve(); }
+      case 'toggle-entitlement-prorate': { var selP = getEntitlementSelection(target.dataset.key); selP.prorate = target.checked; selP.prorateManual = true; render(); return Promise.resolve(); }
       case 'set-entitlement-date-from': STATE.entitlementDateFrom = target.value || null; render(); return Promise.resolve();
       case 'set-entitlement-date-to': STATE.entitlementDateTo = target.value || null; render(); return Promise.resolve();
       default: return Promise.resolve();
