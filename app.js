@@ -1076,9 +1076,20 @@
   function loadProfileAndData(){
     return supabase.from('profiles').select('*').eq('id', STATE.session.user.id).single().then(function(res){
       if(res.error || !res.data){ throw new Error('Could not load your account. If you just signed up, make sure your admin invited this exact email.'); }
-      if(!res.data.active){
+      // Two independent ways an account can be locked out: an admin
+      // explicitly flipped Deactivate, or their Date of Termination has
+      // actually arrived. The termination check is deliberately date-based
+      // rather than tied to the `active` flag, so a *future* termination
+      // date (e.g. serving out a notice period) doesn't cut anyone off
+      // early - they keep normal access right up until that date, then are
+      // locked out automatically from the next login attempt onward with no
+      // separate Deactivate step required.
+      var isTerminated = res.data.date_of_termination && res.data.date_of_termination<=todayStr();
+      if(!res.data.active || isTerminated){
         return supabase.auth.signOut().then(function(){
-          STATE.authError = 'This account has been deactivated. Contact your administrator.';
+          STATE.authError = isTerminated
+            ? 'This account\'s employment has ended. Contact your administrator.'
+            : 'This account has been deactivated. Contact your administrator.';
           throw new Error('deactivated');
         });
       }
@@ -1730,6 +1741,13 @@
       var familyCell = '<button class="link-btn" data-action="toggle-family-row" data-id="'+p.id+'">'+
         (myFamily.length ? (myFamily.length+' member'+(myFamily.length>1?'s':'')) : '-')+
         (isExpanded ? ' ▴' : ' ▾')+'</button>';
+      // The Status column shouldn't rely solely on the `active` flag - a
+      // passed Date of Termination now locks someone out on its own (see
+      // loadProfileAndData), so the directory needs to reflect that even
+      // when nobody has separately clicked Deactivate for them.
+      var isTerminated = p.date_of_termination && p.date_of_termination<=todayStr();
+      var statusLabel = isTerminated ? 'Terminated' : (p.active ? 'Active' : 'Inactive');
+      var statusClass = (isTerminated || !p.active) ? 'status-rejected' : 'status-approved';
       var row = '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td><td>'+escapeHtml(p.nric||'-')+'</td>'+
         '<td><span class="role-chip">'+roleLabel+'</span></td>'+
         '<td>'+familyCell+'</td>'+
@@ -1738,7 +1756,7 @@
         '<td>'+fmtDate(p.date_of_joining)+'</td>'+
         '<td>'+(p.effective_date ? fmtDate(p.effective_date) : '-')+'</td>'+
         '<td>'+terminationCell+'</td>'+
-        '<td><span class="status-pill '+(p.active?'status-approved':'status-rejected')+'">'+(p.active?'Active':'Inactive')+'</span></td>'+
+        '<td><span class="status-pill '+statusClass+'">'+statusLabel+'</span></td>'+
         '<td class="actions-cell">'+actionsCell+'</td></tr>';
       var expandRow = isExpanded ? ('<tr class="reject-row"><td colspan="'+COL_COUNT+'">'+renderFamilyExpandPanel(p, myFamily)+'</td></tr>') : '';
       return row+expandRow;
