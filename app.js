@@ -1850,18 +1850,31 @@
   }
 
   function renderAdminAccess(){
+    var today = todayStr();
     var rows = STATE.profiles.map(function(p){
+      // Same Terminated/Active/Inactive logic as Employee Directory's Status
+      // column (renderAdminStaff), kept in sync here so this screen never
+      // disagrees with that one about whether someone can actually log in -
+      // a Date of Termination set over on Employee Directory already blocks
+      // login on its own (see loadProfileAndData), whether or not anyone
+      // has separately clicked Deactivate for them here.
+      var isTerminated = p.date_of_termination && p.date_of_termination<=today;
+      var statusLabel = isTerminated ? 'Terminated' : (p.active ? 'Active' : 'Inactive');
+      var statusClass = (isTerminated || !p.active) ? 'status-rejected' : 'status-approved';
       return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td>'+
         '<td><select data-action="change-role" data-id="'+p.id+'"><option value="user" '+(p.role==='user'?'selected':'')+'>User</option><option value="admin" '+(p.role==='admin'?'selected':'')+'>Admin</option></select></td>'+
         '<td>'+fmtDate((p.created_at||'').slice(0,10))+'</td>'+
         '<td>'+(!p.active && p.deactivated_at ? fmtDate((p.deactivated_at||'').slice(0,10)) : '-')+'</td>'+
+        '<td><span class="status-pill '+statusClass+'">'+statusLabel+'</span></td>'+
         '<td><button class="btn btn-sm btn-ghost" data-action="toggle-active" data-id="'+p.id+'">'+(p.active?'Deactivate':'Activate')+'</button></td>'+
       '</tr>';
     }).join('');
     return '<div class="card"><div class="card-title">User Access Rights</div><div class="table-wrap"><table class="data-table">'+
-      '<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Date Added</th><th>Date of Deactivation</th><th>Status</th></tr></thead>'+
+      '<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Date Added</th><th>Date of Deactivation</th><th>Status</th><th>Actions</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div>'+
-      '<div class="field-hint">Password resets are self-service - employees use "Forgot password?" on the login screen.</div></div>';
+      '<div class="field-hint">Password resets are self-service - employees use "Forgot password?" on the login screen.</div>'+
+      '<div class="field-hint">Status shows <strong>Terminated</strong> once an employee\'s Date of Termination (set on Employee Directory) has passed, even if nobody has separately clicked Deactivate for them here - their login is already blocked either way, so there\'s no need to do both.</div>'+
+    '</div>';
   }
 
   function sortArrow(col, activeCol, dir){
