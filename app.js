@@ -1050,8 +1050,19 @@
         STATE.entitlementInvoiceItems = results[10].data || [];
         STATE.annualInvoices = results[11].data || [];
       } else {
-        STATE.profiles = STATE.profile ? [STATE.profile] : [];
         STATE.invites = [];
+        // A regular employee's own profile row (allocation, Prorate
+        // setting, etc.) was only ever fetched once at login and then
+        // reused here from memory - so a standing setting an admin changed
+        // for them (e.g. the Prorate toggle) never showed up until they
+        // logged out and back in, even though this function was already
+        // being re-run (after submitting a claim, or via the realtime
+        // subscription below). Re-fetch it fresh every time so those paths
+        // actually pick up the change.
+        return supabase.from('profiles').select('*').eq('id', STATE.session.user.id).single().then(function(res){
+          if(!res.error && res.data){ STATE.profile = res.data; }
+          STATE.profiles = STATE.profile ? [STATE.profile] : [];
+        });
       }
     });
   }
@@ -3364,7 +3375,19 @@
         STATE.passwordRecovery=false; STATE.authView='login'; STATE.authError=''; STATE.authInfo='';
         render();
         return supabase.auth.signOut();
-      case 'nav': STATE.activeTab = btn.dataset.tab; STATE.claimFormError=null; render(); return Promise.resolve();
+      case 'nav':
+        STATE.activeTab = btn.dataset.tab; STATE.claimFormError=null; render();
+        // Landing on the Dashboard quietly re-pulls this employee's own
+        // data (profile, claims, etc.) in the background, so anything an
+        // admin changed for them elsewhere - like the Prorate toggle -
+        // shows up right away. The realtime subscription usually beats
+        // this to it already, but this guarantees it even if that
+        // connection ever drops. The current tab keeps showing whatever
+        // was already loaded while this runs, then re-renders once done.
+        if(STATE.activeTab==='dashboard' && STATE.profile && STATE.profile.role!=='admin'){
+          return loadAppData().then(function(){ render(); }).catch(function(err){ console.error('dashboard refresh failed', err); });
+        }
+        return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
       case 'buy-travel-insurance': window.open('https://sg-customer.qbe.com/travel/partner/01000960', '_blank', 'noopener,noreferrer'); return Promise.resolve();
