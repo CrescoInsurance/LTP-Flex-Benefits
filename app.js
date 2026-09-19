@@ -1551,8 +1551,12 @@
     var pendingInvites = STATE.invites.filter(function(i){ return !i.used; });
     var inviteRows = pendingInvites.map(function(i){
       var welcomeCell;
-      if(i.welcome_email_sent_at){
-        welcomeCell = fmtDateTime(i.welcome_email_sent_at);
+      if(i.welcome_email_sent){
+        // welcome_email_sent_at wasn't being set by the cron function on
+        // older rows (fixed in migration 013) - fall back to a plain "Sent"
+        // label so an already-sent invite never gets stuck showing
+        // "Scheduled for..." forever.
+        welcomeCell = i.welcome_email_sent_at ? fmtDateTime(i.welcome_email_sent_at) : 'Sent';
       } else if(i.effective_date){
         welcomeCell = '<span class="tiny muted">Scheduled for '+fmtDate(i.effective_date)+'</span>';
       } else {
