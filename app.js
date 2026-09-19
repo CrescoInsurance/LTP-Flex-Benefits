@@ -2851,9 +2851,29 @@
     });
   }
 
-  function uploadReceipt(file){
+  // Makes a Storage object name safe and readable: letters/numbers/dashes
+  // only, no run of repeated dashes, nothing leading/trailing.
+  function sanitizeForFilename(s){
+    return String(s||'').trim().replace(/[^a-zA-Z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'file';
+  }
+
+  function uploadReceipt(file, category, receiptDate){
     var ext = (file.name.split('.').pop()||'bin').toLowerCase();
-    var path = STATE.session.user.id + '/' + Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.' + ext;
+    // The FOLDER stays keyed by the employee's auth id - that's what the
+    // receipts_* Storage policies check to enforce "only this employee or
+    // an admin can see this file", and ids are stable/unique in a way a
+    // name never is (two employees can share a name, and a name can be
+    // corrected later). The FILENAME, though, is just for humans browsing
+    // Storage directly during an audit - so it leads with the employee's
+    // name, then the receipt date and category, so a folder's contents are
+    // self-explanatory without having to open the app or match the file to
+    // a claims row first.
+    var namePart = sanitizeForFilename(STATE.profile && STATE.profile.name);
+    var datePart = sanitizeForFilename(receiptDate || new Date().toISOString().slice(0,10));
+    var catPart = sanitizeForFilename(category);
+    var uniquePart = Date.now() + '-' + Math.random().toString(36).slice(2,8);
+    var filename = [namePart, datePart, catPart, uniquePart].filter(Boolean).join('_') + '.' + ext;
+    var path = STATE.session.user.id + '/' + filename;
     return withNetworkRetry(function(){ return supabase.storage.from('receipts').upload(path, file); }).then(function(res){
       if(res.error) throw res.error;
       return {path:path, name:file.name};
@@ -2893,7 +2913,7 @@
       }
       STATE.claimFormError = null;
       btn.textContent = 'Uploading...';
-      return uploadReceipt(file).then(function(receipt){
+      return uploadReceipt(file, category, receiptDate).then(function(receipt){
         return withNetworkRetry(function(){
           return supabase.from('claims').insert({
             employee_id: STATE.session.user.id, category:category, vendor:vendor,
@@ -3008,7 +3028,7 @@
 
       if(file){
         if(file.size > 4*1024*1024){ showToast('File too large - please upload a file under 4MB.', 'error'); return null; }
-        return uploadReceipt(file).then(function(receipt){
+        return uploadReceipt(file, category, receiptDate).then(function(receipt){
           updates.receipt_path = receipt.path; updates.receipt_name = receipt.name;
           return applyUpdate();
         }).catch(function(err){ showToast('Upload failed: '+(err.message||err), 'error'); });
