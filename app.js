@@ -11,8 +11,19 @@
       c.anonKey.indexOf('YOUR-PUBLIC-ANON-KEY') === -1);
   }
 
+  // flowType:'implicit' -- without this, supabase-js defaults to PKCE, which
+  // requires the SAME browser that requested a password reset (or invite)
+  // link to still have a secret in its local storage when the link is
+  // clicked. Reset/invite links are almost always opened from a Mail app or
+  // a different browser/tab than the one that requested them, so PKCE's
+  // exchange fails silently and the person just lands back on the plain
+  // login page instead of the "Set New Password" screen. Implicit flow puts
+  // the session token directly in the link itself, so it works from any
+  // device or browser -- no matching secret required.
   var supabase = configIsValid()
-    ? window.supabase.createClient(window.SUPABASE_CONFIG.url, window.SUPABASE_CONFIG.anonKey)
+    ? window.supabase.createClient(window.SUPABASE_CONFIG.url, window.SUPABASE_CONFIG.anonKey, {
+        auth: { flowType: 'implicit', detectSessionInUrl: true, persistSession: true, autoRefreshToken: true }
+      })
     : null;
 
   // EDIT PER CLIENT: this client's legal name, shown in the topbar.
