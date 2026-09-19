@@ -144,6 +144,45 @@
     });
   }
 
+  // A brief WiFi hiccup, a stale keep-alive connection, or (on Safari) a
+  // content blocker occasionally causes the very FIRST network request in a
+  // while to fail outright before it ever reaches the server -- the retry
+  // almost always succeeds immediately since the browser opens a fresh
+  // connection. Without this, a user hits "Load failed" on login/signup/
+  // forgot-password/submit-claim and has to re-type the whole form just to
+  // try again. This distinguishes that from a REAL error (wrong password,
+  // "already registered", a validation message) which must never be retried
+  // -- retrying those would just waste time and show the same real error twice.
+  var TRANSIENT_NETWORK_ERROR_RE = /load failed|failed to fetch|network connection was lost|networkerror|network request failed|internet connection appears to be offline|err_network|err_internet_disconnected|err_connection|access control checks/i;
+  function isTransientNetworkError(err){
+    var msg = (err && (err.message || err.error_description)) || err || '';
+    return TRANSIENT_NETWORK_ERROR_RE.test(String(msg));
+  }
+  // fn is a factory returning a fresh promise each call (Supabase-style
+  // {data,error} result, or a thrown/rejected error). On a transient network
+  // failure -- whether it shows up as a resolved {error:...} (how Supabase
+  // normally reports it) or an outright rejection -- waits briefly and calls
+  // fn() again exactly once before giving up, via the `retried` flag below,
+  // so a real, repeatable failure still surfaces to the user normally.
+  function withNetworkRetry(fn){
+    var retried = false;
+    function handle(res){
+      if(res && res.error && !retried && isTransientNetworkError(res.error)){
+        retried = true;
+        return new Promise(function(resolve){ setTimeout(resolve, 700); }).then(fn).then(handle, onError);
+      }
+      return res;
+    }
+    function onError(err){
+      if(!retried && isTransientNetworkError(err)){
+        retried = true;
+        return new Promise(function(resolve){ setTimeout(resolve, 700); }).then(fn).then(handle, onError);
+      }
+      throw err;
+    }
+    return fn().then(handle, onError);
+  }
+
   function fetchRateFrankfurter(currency){
     return fetch('https://api.frankfurter.app/latest?from='+encodeURIComponent(currency)+'&to=SGD')
       .then(function(res){ if(!res.ok) throw new Error('Frankfurter returned '+res.status); return res.json(); })
@@ -1027,6 +1066,21 @@
 
   function init(){
     if(!supabase){ STATE.loading = false; render(); return; }
+    // Register this before getSession() so the client's own detection of a
+    // password-recovery link in the URL (which happens as soon as the page
+    // loads) is never missed -- it fires PASSWORD_RECOVERY here rather than
+    // just quietly logging the person in with their old password still active.
+    supabase.auth.onAuthStateChange(function(event, session){
+      if(event === 'SIGNED_OUT'){
+        STATE.session = null; STATE.profile = null; STATE.activeTab = null;
+        render();
+      }
+      if(event === 'PASSWORD_RECOVERY'){
+        STATE.passwordRecovery = true;
+        STATE.loading = false;
+        render();
+      }
+    });
     STATE.loading = true; render();
     supabase.auth.getSession().then(function(res){
       STATE.session = res.data.session;
@@ -1041,13 +1095,6 @@
       STATE.session = null; STATE.profile = null; STATE.loading = false;
       render();
     });
-
-    supabase.auth.onAuthStateChange(function(event, session){
-      if(event === 'SIGNED_OUT'){
-        STATE.session = null; STATE.profile = null; STATE.activeTab = null;
-        render();
-      }
-    });
   }
 
   /* =========================================================
@@ -1057,6 +1104,7 @@
     var app = document.getElementById('app');
     if(!supabase){ app.innerHTML = renderSetupNeeded(); return; }
     if(STATE.loading){ app.innerHTML = renderLoading() + renderBrandFooter(); return; }
+    if(STATE.passwordRecovery){ app.innerHTML = renderResetPassword() + renderBrandFooter(); return; }
     if(!STATE.session || !STATE.profile){ app.innerHTML = renderAuthScreen() + renderBrandFooter(); return; }
     app.innerHTML = (STATE.profile.role==='admin' ? renderAdminShell() : renderUserShell()) + renderBrandFooter();
     if(STATE.modal){
@@ -1116,7 +1164,10 @@
      AUTH VIEWS
   ========================================================== */
   function renderAuthScreen(){
-    return STATE.authView === 'signup' ? renderSignup() : renderLogin();
+    if(STATE.authView === 'signup') return renderSignup();
+    if(STATE.authView === 'forgot') return renderForgotPassword();
+    if(STATE.authView === 'forgot-sent') return renderForgotPasswordSent();
+    return renderLogin();
   }
 
   function renderLogin(){
@@ -1131,8 +1182,41 @@
       '</form>'+
       '<div class="auth-toggle">'+
         '<button data-action="show-signup">New User Login</button>'+
-        '<button data-action="forgot-password">Forgot password?</button>'+
+        '<button data-action="show-forgot-password">Forgot password?</button>'+
       '</div>'+
+    '</div></div>';
+  }
+
+  function renderForgotPassword(){
+    return '<div class="login-wrap"><div class="login-card">'+
+      '<div class="login-brand"><img src="'+LOGO_ICON_DATA_URI+'" class="login-logo" alt="logo" /><h1>Forgot Password</h1><p class="muted">Enter your email and we\'ll send you a reset link</p></div>'+
+      '<form data-form="forgot-password" class="login-form">'+
+        '<label>Email<input type="email" name="email" autocomplete="username" required placeholder="you@company.com" /></label>'+
+        (STATE.authError ? '<div class="field-error">'+escapeHtml(STATE.authError)+'</div>' : '')+
+        '<button type="submit" class="btn btn-primary btn-block">Send Reset Link</button>'+
+      '</form>'+
+      '<div class="auth-toggle"><button data-action="back-to-login">Back to Login</button></div>'+
+    '</div></div>';
+  }
+
+  function renderForgotPasswordSent(){
+    return '<div class="login-wrap"><div class="login-card">'+
+      '<div class="login-brand"><img src="'+LOGO_ICON_DATA_URI+'" class="login-logo" alt="logo" /><h1>Check Your Email</h1>'+
+      '<p class="muted">If an account exists for that email, we\'ve sent a link to reset your password. Click the link in the email to continue.</p></div>'+
+      '<div class="auth-toggle"><button data-action="back-to-login" class="btn btn-primary btn-block">Back to Login</button></div>'+
+    '</div></div>';
+  }
+
+  function renderResetPassword(){
+    return '<div class="login-wrap"><div class="login-card">'+
+      '<div class="login-brand"><img src="'+LOGO_ICON_DATA_URI+'" class="login-logo" alt="logo" /><h1>Set New Password</h1><p class="muted">Choose a new password for your account</p></div>'+
+      '<form data-form="reset-password" class="login-form">'+
+        '<label>New Password<input type="password" name="password" autocomplete="new-password" required minlength="6" placeholder="At least 6 characters" /></label>'+
+        '<label>Confirm Password<input type="password" name="confirmPassword" autocomplete="new-password" required placeholder="Repeat your new password" /></label>'+
+        (STATE.authError ? '<div class="field-error">'+escapeHtml(STATE.authError)+'</div>' : '')+
+        '<button type="submit" class="btn btn-primary btn-block">Save New Password</button>'+
+      '</form>'+
+      '<div class="auth-toggle"><button data-action="cancel-reset-password">Cancel and go back to login</button></div>'+
     '</div></div>';
   }
 
@@ -2594,7 +2678,7 @@
     var password = form.password.value;
     var btn = form.querySelector('button[type=submit]');
     btn.disabled = true; btn.textContent = 'Logging in...';
-    return supabase.auth.signInWithPassword({email:email, password:password}).then(function(res){
+    return withNetworkRetry(function(){ return supabase.auth.signInWithPassword({email:email, password:password}); }).then(function(res){
       if(res.error){ STATE.authError = res.error.message; render(); return; }
       STATE.authError=''; STATE.authInfo=''; STATE.session = res.data.session;
       STATE.loading = true; render();
@@ -2608,6 +2692,9 @@
         if(err.message!=='deactivated'){ STATE.authError = err.message; }
         render();
       });
+    }).catch(function(err){
+      STATE.authError = (err && err.message) || 'Login failed - please try again.';
+      render();
     });
   }
 
@@ -2620,7 +2707,7 @@
     var btn = form.querySelector('button[type=submit]');
     btn.disabled = true; btn.textContent = 'Creating account...';
     var redirectTo = window.location.origin + window.location.pathname;
-    return supabase.auth.signUp({email:email, password:password, options:{emailRedirectTo:redirectTo}}).then(function(res){
+    return withNetworkRetry(function(){ return supabase.auth.signUp({email:email, password:password, options:{emailRedirectTo:redirectTo}}); }).then(function(res){
       if(res.error){
         var msg = res.error.message || '';
         if(/already registered|already exists|already been registered/i.test(msg)){
@@ -2651,25 +2738,49 @@
       STATE.authView='login'; STATE.authError='';
       STATE.authInfo='Account created! Check your email to confirm, then log in.';
       render();
+    }).catch(function(err){
+      STATE.authError = (err && err.message) || 'Could not create account - please try again.';
+      render();
     });
   }
 
-  function handleForgotPassword(){
-    var emailInput = document.querySelector('form[data-form="login"] input[name="email"]');
-    var email = emailInput ? emailInput.value.trim() : '';
-    if(!email){ showToast('Enter your email above first, then click "Forgot password?".', 'error'); return Promise.resolve(); }
-    STATE.authError = ''; render();
-    var btn = document.querySelector('[data-action="forgot-password"]');
-    var originalLabel = btn ? btn.textContent : '';
-    if(btn){ btn.disabled = true; btn.textContent = 'Sending...'; }
+  function doForgotPassword(form){
+    var email = form.email.value.trim();
+    var btn = form.querySelector('button[type=submit]');
+    btn.disabled = true; btn.textContent = 'Sending...';
+    STATE.authError = '';
     var redirectTo = window.location.origin + window.location.pathname;
-    return withTimeout(supabase.auth.resetPasswordForEmail(email, {redirectTo:redirectTo}), 8000, 'Password reset request').then(function(res){
-      if(res.error){ showToast('Could not send reset email: '+res.error.message, 'error'); return; }
-      showToast('Password reset email sent - check your inbox.', 'success');
+    return withNetworkRetry(function(){ return withTimeout(supabase.auth.resetPasswordForEmail(email, {redirectTo:redirectTo}), 8000, 'Password reset request'); }).then(function(res){
+      if(res.error){ STATE.authError = res.error.message; render(); return; }
+      STATE.authView = 'forgot-sent'; STATE.authError = '';
+      render();
     }).catch(function(err){
-      showToast('Could not send reset email: '+((err && err.message) || err), 'error');
-    }).then(function(){
-      if(btn){ btn.disabled = false; btn.textContent = originalLabel || 'Forgot password?'; }
+      STATE.authError = (err && err.message) || 'Could not send reset email - please try again.';
+      render();
+    });
+  }
+
+  function doResetPassword(form){
+    var password = form.password.value;
+    var confirmPassword = form.confirmPassword.value;
+    if(password !== confirmPassword){ STATE.authError = 'Passwords do not match.'; render(); return Promise.resolve(); }
+    if(password.length < 6){ STATE.authError = 'Password must be at least 6 characters.'; render(); return Promise.resolve(); }
+    var btn = form.querySelector('button[type=submit]');
+    btn.disabled = true; btn.textContent = 'Saving...';
+    STATE.authError = '';
+    return withNetworkRetry(function(){ return supabase.auth.updateUser({password:password}); }).then(function(res){
+      if(res.error){ STATE.authError = res.error.message; render(); return; }
+      // Drop the temporary recovery session and send them to the ordinary
+      // login screen to sign in fresh with the new password -- same pattern
+      // as new-user signup, rather than silently carrying them into the app.
+      STATE.passwordRecovery = false;
+      STATE.authView = 'login'; STATE.authError = '';
+      STATE.authInfo = 'Password updated - please log in with your new password.';
+      render();
+      return supabase.auth.signOut();
+    }).catch(function(err){
+      STATE.authError = (err && err.message) || 'Could not update password - please try again.';
+      render();
     });
   }
 
@@ -2689,7 +2800,7 @@
   function uploadReceipt(file){
     var ext = (file.name.split('.').pop()||'bin').toLowerCase();
     var path = STATE.session.user.id + '/' + Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.' + ext;
-    return supabase.storage.from('receipts').upload(path, file).then(function(res){
+    return withNetworkRetry(function(){ return supabase.storage.from('receipts').upload(path, file); }).then(function(res){
       if(res.error) throw res.error;
       return {path:path, name:file.name};
     });
@@ -2729,11 +2840,13 @@
       STATE.claimFormError = null;
       btn.textContent = 'Uploading...';
       return uploadReceipt(file).then(function(receipt){
-        return supabase.from('claims').insert({
-          employee_id: STATE.session.user.id, category:category, vendor:vendor,
-          amount:amount, currency:currency, amount_sgd:amountSgd, exchange_rate:rate,
-          receipt_date:receiptDate, receipt_path:receipt.path, receipt_name:receipt.name, status:'pending',
-          family_member_id: familyMemberId
+        return withNetworkRetry(function(){
+          return supabase.from('claims').insert({
+            employee_id: STATE.session.user.id, category:category, vendor:vendor,
+            amount:amount, currency:currency, amount_sgd:amountSgd, exchange_rate:rate,
+            receipt_date:receiptDate, receipt_path:receipt.path, receipt_name:receipt.name, status:'pending',
+            family_member_id: familyMemberId
+          });
         });
       });
     }).then(function(res){
@@ -3197,7 +3310,12 @@
     switch(action){
       case 'show-signup': STATE.authView='signup'; STATE.authError=''; STATE.authInfo=''; render(); return Promise.resolve();
       case 'show-login': STATE.authView='login'; STATE.authError=''; STATE.authInfo=''; render(); return Promise.resolve();
-      case 'forgot-password': return handleForgotPassword();
+      case 'show-forgot-password': STATE.authView='forgot'; STATE.authError=''; STATE.authInfo=''; render(); return Promise.resolve();
+      case 'back-to-login': STATE.authView='login'; STATE.authError=''; STATE.authInfo=''; render(); return Promise.resolve();
+      case 'cancel-reset-password':
+        STATE.passwordRecovery=false; STATE.authView='login'; STATE.authError=''; STATE.authInfo='';
+        render();
+        return supabase.auth.signOut();
       case 'nav': STATE.activeTab = btn.dataset.tab; STATE.claimFormError=null; render(); return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
@@ -3367,6 +3485,8 @@
     var type = form.dataset.form;
     if(type==='login') return doLogin(form);
     if(type==='signup') return doSignup(form);
+    if(type==='forgot-password') return doForgotPassword(form);
+    if(type==='reset-password') return doResetPassword(form);
     if(type==='submit-claim') return submitClaim(form);
     if(type==='invite-staff') return inviteStaff(form);
     if(type==='add-family-inline') return addFamilyMemberInline(form);
