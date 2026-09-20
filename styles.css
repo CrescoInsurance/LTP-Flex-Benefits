@@ -218,6 +218,10 @@
     .topbar-logo{height:52px;}
     .brand-title{font-size:14px;}
     .brand-client{font-size:10px;}
+    /* Keeps the row's action buttons reachable without scrolling all the
+       way across a wide table on a phone - the actions column stays
+       pinned to the right edge while the rest of the row scrolls under it. */
+    .data-table td.actions-cell{position:sticky;right:0;background:#fff;box-shadow:-8px 0 8px -6px rgba(0,0,0,.14);z-index:1;}
   }
   @media(max-width:480px){
     .grid-cards{grid-template-columns:1fr;}
@@ -235,3 +239,28 @@
   .banner-danger{background:var(--danger-bg);color:var(--danger);}
   .banner-success{background:var(--success-bg);color:var(--success);}
   .banner-warning{background:var(--warning-bg);color:var(--warning);}
+
+  /* ---------- Polish pass (borrowed from the Cresco build, re-themed) ---------- */
+  /* Custom dropdown arrow so every <select> matches our own palette instead
+     of the browser's native chevron. Colour is baked into the SVG itself
+     (can't reference a CSS variable inside a data-URI), set to match
+     --text-muted above - update both together if that colour ever changes. */
+  select{
+    appearance:none;-webkit-appearance:none;-moz-appearance:none;
+    background-image:url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3e%3cpath d='M5 7l5 5 5-5' stroke='%235f7472' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3e%3c/svg%3e");
+    background-repeat:no-repeat;background-position:right 10px center;background-size:14px;
+    padding-right:32px;
+  }
+  select:disabled{opacity:.6;cursor:not-allowed;background-color:var(--bg);}
+  select:focus{outline:2px solid var(--primary);outline-offset:1px;}
+
+  /* Checkbox/radio ticks pick up our theme colour instead of the OS default (usually blue). */
+  input[type=checkbox], input[type=radio]{accent-color:var(--primary);}
+
+  /* Date pickers weren't explicitly styled anywhere before (e.g. the New
+     Hire Invoicing From/To range) and fell back to the bare browser look. */
+  input[type=date]{padding:9px 10px;border-radius:var(--radius-sm);border:1px solid var(--border);font-family:inherit;color:var(--text);}
+
+  /* A .field-hint left with no text (nothing to show) no longer renders as
+     an empty coloured box. */
+  .field-hint:empty{display:none;}
