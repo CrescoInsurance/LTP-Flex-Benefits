@@ -637,21 +637,48 @@
     }).reduce(function(s,p){ return s+(Number(p.annual_allocation)||0); }, 0);
   }
 
-  // Everything actually billed to the client to date (Initial, New Hire and
-  // Promotion invoices via entitlement_invoices, plus every issued Annual
-  // Invoice's net payable amount), minus everything already paid out to
-  // employees via approved claims. This assumes every issued invoice gets
-  // paid in full and promptly - there's no "payment received" tracking yet,
-  // so a client that pays late or short will make this read a little
-  // optimistic until that's built.
+  // Everything actually COLLECTED from the client to date (Initial, New Hire
+  // and Promotion invoices via entitlement_invoices - counted only once
+  // marked Paid on Invoice History, not merely issued - plus every issued
+  // Annual Invoice's net payable amount), minus everything already paid out
+  // to employees via approved claims.
+  //
+  // Entitlement invoices need the explicit Paid check because that money is
+  // what actually backs employee claims - crediting it before it's in hand
+  // would make this read optimistic. The Annual Invoice's headcount charge
+  // is deliberately NOT gated the same way: any shortfall there self-corrects
+  // through next year's True-Up regardless of when it's actually paid, so it
+  // stays counted immediately on issue as before.
   function moneyHoldingBalance(){
-    var billedEnt = (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued'; })
+    var billedEnt = (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued' && i.paid; })
       .reduce(function(s,i){ return s+(Number(i.total_amount)||0); }, 0);
     var billedAnnual = (STATE.annualInvoices||[]).filter(function(i){ return i.status==='issued'; })
       .reduce(function(s,i){ return s+(Number(i.invoice_payable_amount)||0); }, 0);
     var paidOut = (STATE.claims||[]).filter(function(c){ return c.status==='approved'; })
       .reduce(function(s,c){ return s+sgdAmountOf(c); }, 0);
     return billedEnt + billedAnnual - paidOut;
+  }
+
+  // Issued entitlement invoices the client hasn't been marked as having
+  // paid yet - drives the Invoice History "awaiting payment" badge and the
+  // Employee Directory's per-employee payment-pending flag. Entitlement
+  // credit to the employee's own wallet is NOT gated on this (that's set
+  // immediately by saveAlloc()/confirmPromotion(), see totalPlannedEntitlement
+  // above) - this is purely about knowing which invoices still need chasing
+  // and keeping Money Holding accurate.
+  function unpaidEntitlementInvoices(){
+    return (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued' && !i.paid; });
+  }
+
+  // Does this employee appear on any issued-but-unpaid entitlement invoice?
+  // Used to colour-code the Employee Directory so payment follow-up doesn't
+  // depend on remembering to check Invoice History separately.
+  function employeeHasUnpaidEntitlementInvoice(employeeId){
+    var unpaidIds = unpaidEntitlementInvoices().map(function(i){ return i.id; });
+    if(!unpaidIds.length) return false;
+    return (STATE.entitlementInvoiceItems||[]).some(function(item){
+      return item.employee_id===employeeId && unpaidIds.indexOf(item.invoice_id)!==-1;
+    });
   }
 
   // The single source of truth both the New Hire Invoicing badges and its
@@ -761,6 +788,30 @@
           });
         });
       });
+    }).then(function(){ render(); });
+  }
+
+  // Marks (or un-marks) an issued entitlement invoice as actually paid by
+  // the client. This is the one thing that feeds moneyHoldingBalance() and,
+  // through it, the 80% utilisation reminder and the Employee Directory's
+  // payment-pending flag - it does NOT touch anyone's annual_allocation,
+  // which was already credited the moment the new hire/promotion happened.
+  function toggleEntitlementInvoicePaid(id){
+    var inv = (STATE.entitlementInvoices||[]).filter(function(i){ return i.id===id; })[0];
+    if(!inv) return Promise.resolve();
+    var newPaid = !inv.paid;
+    var updates = {
+      paid:newPaid,
+      paid_at: newPaid ? new Date().toISOString() : null,
+      // Same convention as issued_by/voided_by elsewhere in this file -
+      // the auth user id, which is also the profiles.id (see
+      // handle_new_user() in migration 002).
+      paid_by: newPaid ? STATE.session.user.id : null
+    };
+    return supabase.from('entitlement_invoices').update(updates).eq('id', id).then(function(res){
+      if(res.error){ showToast('Could not update payment status: '+res.error.message, 'error'); return; }
+      showToast('Invoice '+inv.invoice_number+' marked '+(newPaid?'paid.':'unpaid.'), 'success');
+      return loadAppData();
     }).then(function(){ render(); });
   }
 
@@ -1599,7 +1650,11 @@
     // (entitlementCushionStatus().reminderCount) - not merely whenever
     // something is technically un-invoiced, which is normal and fine as
     // long as the float hasn't run down that far.
-    var financeReminderCount = entitlementCushionStatus().reminderCount;
+    // Combines two distinct reasons Finance needs a look - items awaiting
+    // invoicing (utilisation-triggered) and invoices already issued but not
+    // yet marked paid - into one top-nav count; the New Hire Invoicing and
+    // Invoice History sub-tab badges break the two back out individually.
+    var financeReminderCount = entitlementCushionStatus().reminderCount + unpaidEntitlementInvoices().length;
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
       '<div class="tabs">'+
@@ -1629,13 +1684,14 @@
   function renderAdminFinanceModule(){
     var sub = STATE.financeSubTab || 'annual';
     var reminderCount = entitlementCushionStatus().reminderCount;
+    var unpaidCount = unpaidEntitlementInvoices().length;
     var subTabBtn = function(key, label){
       return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
     };
     return '<div class="tabs" style="margin-bottom:16px;">'+
         subTabBtn('annual','Annual Invoice')+
         subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
-        subTabBtn('history','Invoice History')+
+        subTabBtn('history','Invoice History'+(unpaidCount?' <span class="badge">'+unpaidCount+'</span>':''))+
       '</div>'+
       (sub==='newhire' ? renderAdminNewHireInvoicing() :
        sub==='history' ? renderAdminInvoiceHistory() :
@@ -1748,6 +1804,12 @@
       var isTerminated = p.date_of_termination && p.date_of_termination<=todayStr();
       var statusLabel = isTerminated ? 'Terminated' : (p.active ? 'Active' : 'Inactive');
       var statusClass = (isTerminated || !p.active) ? 'status-rejected' : 'status-approved';
+      // Separate from employment Status on purpose - this is about billing
+      // (has the client actually paid for this person's entitlement invoice
+      // yet), not employment, so it's its own small line rather than folded
+      // into the status pill above.
+      var paymentFlag = employeeHasUnpaidEntitlementInvoice(p.id)
+        ? '<div class="tiny" style="color:var(--danger); margin-top:3px;">&#9679; Payment pending</div>' : '';
       var row = '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td><td>'+escapeHtml(p.nric||'-')+'</td>'+
         '<td><span class="role-chip">'+roleLabel+'</span></td>'+
         '<td>'+familyCell+'</td>'+
@@ -1756,7 +1818,7 @@
         '<td>'+fmtDate(p.date_of_joining)+'</td>'+
         '<td>'+(p.effective_date ? fmtDate(p.effective_date) : '-')+'</td>'+
         '<td>'+terminationCell+'</td>'+
-        '<td><span class="status-pill '+statusClass+'">'+statusLabel+'</span></td>'+
+        '<td><span class="status-pill '+statusClass+'">'+statusLabel+'</span>'+paymentFlag+'</td>'+
         '<td class="actions-cell">'+actionsCell+'</td></tr>';
       var expandRow = isExpanded ? ('<tr class="reject-row"><td colspan="'+COL_COUNT+'">'+renderFamilyExpandPanel(p, myFamily)+'</td></tr>') : '';
       return row+expandRow;
@@ -2074,12 +2136,14 @@
         ? ('80% or more of the total entitlement has been utilised - '+c.reminderCount+' item'+(c.reminderCount===1?'':'s')+' below (new hires and/or promotions) should be batched into an invoice to top up the float.')
         : 'Utilisation is under 80% - any new hires or promotions below can wait; no invoicing required yet.';
     var statusColor = (c.planned>0 && c.belowThreshold) ? 'var(--danger)' : 'var(--success)';
+    var unpaidCount = unpaidEntitlementInvoices().length;
     return '<div class="report-summary" style="margin-bottom:8px;">'+
         'Money Holding: <strong>'+fmtMoney(c.holding)+'</strong> &middot; '+
         'Total Planned Entitlement: <strong>'+fmtMoney(c.planned)+'</strong> &middot; '+
         'Utilisation: <strong>'+pctLabel+'</strong>'+
       '</div>'+
-      '<div class="field-hint" style="margin-bottom:14px; color:'+statusColor+';">'+statusLine+'</div>';
+      '<div class="field-hint" style="margin-bottom:14px; color:'+statusColor+';">'+statusLine+'</div>'+
+      (unpaidCount ? ('<div class="field-hint" style="margin-bottom:14px; color:var(--warning);">'+unpaidCount+' issued invoice'+(unpaidCount===1?'':'s')+' awaiting payment confirmation - Money Holding above won\'t include '+(unpaidCount===1?'it':'them')+' until marked Paid on Invoice History.</div>') : '');
   }
 
   function renderAdminNewHireInvoicing(){
@@ -2137,25 +2201,36 @@
       var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="entitlement" data-id="'+inv.id+'">Void</button>' : '';
       var supersedesRow = inv.supersedes_invoice_id ? STATE.entitlementInvoices.filter(function(i){ return i.id===inv.supersedes_invoice_id; })[0] : null;
       var numberCell = escapeHtml(inv.invoice_number)+(supersedesRow ? '<div class="tiny muted">supersedes '+escapeHtml(supersedesRow.invoice_number)+'</div>' : '');
-      return '<tr><td>'+numberCell+'</td><td>'+typeLabel+'</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>'+itemCount+'</td><td>'+fmtMoney(inv.total_amount)+'</td><td>'+statusHtml+'</td>'+
+      // Only entitlement invoices carry a Paid flag at all (see
+      // moneyHoldingBalance's comment) - a voided one shows a dash since
+      // there's nothing left to collect on it either way.
+      var paidByProfile = inv.paid_by ? profileById(inv.paid_by) : null;
+      var paidDetail = inv.paid
+        ? ('Paid'+(inv.paid_at?(' '+fmtDate(inv.paid_at.slice(0,10))):'')+(paidByProfile?(' by '+escapeHtml(paidByProfile.name)):''))
+        : '<span style="color:var(--danger); font-weight:600;">Awaiting payment</span>';
+      var paymentCell = inv.status!=='issued' ? '<span class="tiny muted">&mdash;</span>' :
+        '<label class="tiny" style="white-space:nowrap; cursor:pointer;"><input type="checkbox" data-action="toggle-invoice-paid" data-id="'+inv.id+'" '+(inv.paid?'checked':'')+'/> '+paidDetail+'</label>';
+      return '<tr><td>'+numberCell+'</td><td>'+typeLabel+'</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>'+itemCount+'</td><td>'+fmtMoney(inv.total_amount)+'</td><td>'+statusHtml+'</td><td>'+paymentCell+'</td>'+
         '<td><button class="link-btn tiny" data-action="download-entitlement-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
-        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='entitlement' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
+        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='entitlement' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="8">'+renderVoidPanel()+'</td></tr>' : '');
     }).join('');
     var annRows = STATE.annualInvoices.slice().sort(function(a,b){ return (b.issued_at||'').localeCompare(a.issued_at||''); }).map(function(inv){
       var statusHtml = inv.status==='voided' ? '<span class="tiny" style="color:var(--danger);">Voided'+(inv.voided_reason?(' - '+escapeHtml(inv.voided_reason)):'')+'</span>' : '<span class="tiny" style="color:var(--success);">Issued</span>';
       var voidBtn = inv.status==='issued' ? '<button class="link-btn tiny" data-action="start-void-invoice" data-type="annual" data-id="'+inv.id+'">Void</button>' : '';
       var annSupersedesRow = inv.supersedes_invoice_id ? STATE.annualInvoices.filter(function(a){ return a.id===inv.supersedes_invoice_id; })[0] : null;
       var annNumberCell = escapeHtml(inv.invoice_number)+(annSupersedesRow ? '<div class="tiny muted">supersedes '+escapeHtml(annSupersedesRow.invoice_number)+'</div>' : '');
-      return '<tr><td>'+annNumberCell+'</td><td>Annual Invoice ('+inv.year+')</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>&mdash;</td><td>'+fmtMoney(inv.invoice_payable_amount)+'</td><td>'+statusHtml+'</td>'+
+      // Headcount charges settle through next year's True-Up regardless of
+      // when they're paid, so the Annual Invoice never shows a Paid toggle.
+      return '<tr><td>'+annNumberCell+'</td><td>Annual Invoice ('+inv.year+')</td><td>'+fmtDate((inv.issued_at||'').slice(0,10))+'</td><td>&mdash;</td><td>'+fmtMoney(inv.invoice_payable_amount)+'</td><td>'+statusHtml+'</td><td><span class="tiny muted">N/A</span></td>'+
         '<td><button class="link-btn tiny" data-action="download-annual-invoice" data-id="'+inv.id+'">Download</button> '+voidBtn+'</td></tr>'+
-        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="7">'+renderVoidPanel()+'</td></tr>' : '');
+        ((STATE.voidingInvoice && STATE.voidingInvoice.type==='annual' && STATE.voidingInvoice.id===inv.id) ? '<tr><td colspan="8">'+renderVoidPanel()+'</td></tr>' : '');
     }).join('');
     var allRows = entRows+annRows;
     return '<div class="card">'+
       '<div class="card-title">Invoice History</div>'+
-      '<div class="field-hint" style="margin-bottom:14px;">Every invoice ever issued to this client - Annual Invoices and New Hire / Promotion / Initial Roster invoices together, newest first. Each is re-downloadable exactly as issued. Voiding requires a reason and keeps the original visible here for the record; a corrected invoice issued afterward gets the next number in sequence.</div>'+
+      '<div class="field-hint" style="margin-bottom:14px;">Every invoice ever issued to this client - Annual Invoices and New Hire / Promotion / Initial Roster invoices together, newest first. Each is re-downloadable exactly as issued. Voiding requires a reason and keeps the original visible here for the record; a corrected invoice issued afterward gets the next number in sequence. Tick Payment once the client has actually settled an entitlement invoice - that\'s what Money Holding on New Hire Invoicing is based on, not just whether it was issued.</div>'+
       (allRows ? ('<div class="table-wrap"><table class="data-table">'+
-        '<thead><tr><th>Invoice #</th><th>Type</th><th>Issued</th><th>Employees</th><th>Amount</th><th>Status</th><th></th></tr></thead>'+
+        '<thead><tr><th>Invoice #</th><th>Type</th><th>Issued</th><th>Employees</th><th>Amount</th><th>Status</th><th>Payment</th><th></th></tr></thead>'+
         '<tbody>'+allRows+'</tbody></table></div>')
         : '<div class="empty-state">No invoices issued yet.</div>')+
     '</div>';
@@ -3700,6 +3775,7 @@
 
       /* ---- Void + Reissue (both invoice types) ---- */
       case 'start-void-invoice': STATE.voidingInvoice = {type: btn.dataset.type, id: id}; STATE.voidReasonDraft=''; render(); return Promise.resolve();
+      case 'toggle-invoice-paid': return toggleEntitlementInvoicePaid(id);
       case 'cancel-void-invoice': STATE.voidingInvoice=null; STATE.voidReasonDraft=''; render(); return Promise.resolve();
       case 'confirm-void-invoice': {
         var voidReasonInput = document.getElementById('void-reason-input');
