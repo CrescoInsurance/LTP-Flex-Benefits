@@ -630,6 +630,16 @@
   // reflects the full current commitment - mid-year new hires and
   // promotions both included - with no risk of double-counting once
   // they're later billed.
+  // Same "currently active" filter used by totalPlannedEntitlement below,
+  // just returning the raw headcount instead of the dollar sum - this is
+  // the Head Count figure on the money banner.
+  function activeEmployeeCount(){
+    var today = todayStr();
+    return (STATE.profiles||[]).filter(function(p){
+      return p.role==='user' && (!p.effective_date || p.effective_date<=today) && (!p.date_of_termination || p.date_of_termination>=today);
+    }).length;
+  }
+
   function totalPlannedEntitlement(){
     var today = todayStr();
     return (STATE.profiles||[]).filter(function(p){
@@ -637,21 +647,22 @@
     }).reduce(function(s,p){ return s+(Number(p.annual_allocation)||0); }, 0);
   }
 
-  // Everything actually COLLECTED from the client to date (Initial, New Hire
-  // and Promotion invoices via entitlement_invoices - counted only once
-  // marked Paid on Invoice History, not merely issued - plus every issued
-  // Annual Invoice's net payable amount), minus everything already paid out
-  // to employees via approved claims.
+  // Everything actually COLLECTED from the client to date that's genuinely
+  // available to fund employee claims, minus everything already paid out to
+  // employees via approved claims.
   //
-  // Entitlement invoices need the explicit Paid check because that money is
-  // what actually backs employee claims - crediting it before it's in hand
-  // would make this read optimistic. The Annual Invoice's headcount charge
-  // is deliberately NOT gated the same way: any shortfall there self-corrects
-  // through next year's True-Up regardless of when it's actually paid, so it
-  // stays counted immediately on issue as before.
+  // Deliberately uses entitlement_total, NOT total_amount, from each paid
+  // entitlement invoice - total_amount also includes the one-time per-pax
+  // Headcount Establishment Charge on an Initial Roster invoice, which is a
+  // setup fee for Cresco, not client money held to back claims, so counting
+  // it here would overstate the float. The Annual Invoice's headcount
+  // charge is excluded from this "paid" gating entirely for the same
+  // reason, on top of self-correcting through next year's True-Up
+  // regardless of when it's actually paid - it stays counted immediately on
+  // issue, same as before.
   function moneyHoldingBalance(){
     var billedEnt = (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued' && i.paid; })
-      .reduce(function(s,i){ return s+(Number(i.total_amount)||0); }, 0);
+      .reduce(function(s,i){ return s+(Number(i.entitlement_total)||0); }, 0);
     var billedAnnual = (STATE.annualInvoices||[]).filter(function(i){ return i.status==='issued'; })
       .reduce(function(s,i){ return s+(Number(i.invoice_payable_amount)||0); }, 0);
     var paidOut = (STATE.claims||[]).filter(function(c){ return c.status==='approved'; })
@@ -668,6 +679,16 @@
   // and keeping Money Holding accurate.
   function unpaidEntitlementInvoices(){
     return (STATE.entitlementInvoices||[]).filter(function(i){ return i.status==='issued' && !i.paid; });
+  }
+
+  // The money banner's "Pending Payment" figure - same entitlement_total
+  // vs total_amount distinction as moneyHoldingBalance() above, so the two
+  // numbers stay consistent with each other (this is what Money Holding
+  // will go UP by, once these are all marked paid). The per-pax headcount
+  // setup fee sitting on the same unpaid invoices isn't included here
+  // either, for the same reason it's excluded from Money Holding.
+  function pendingEntitlementPaymentAmount(){
+    return unpaidEntitlementInvoices().reduce(function(s,i){ return s+(Number(i.entitlement_total)||0); }, 0);
   }
 
   // Does this employee appear on any issued-but-unpaid entitlement invoice?
@@ -701,6 +722,54 @@
       // the reminder is about the backlog below, not the utilisation alone.
       reminderCount: (belowThreshold && pendingCount) ? pendingCount : 0
     };
+  }
+
+  // Persistent strip shown on every admin screen (see renderAdminShell)
+  // regardless of which tab is open, so Money Holding/Utilisation is
+  // always a glance away rather than buried on the New Hire Invoicing
+  // sub-tab. Five figures, left to right: cash actually held for the
+  // client's entitlement pool, the pool it's meant to cover, entitlement
+  // dollars billed but not yet confirmed paid, how many employees that
+  // pool is spread across, and the resulting utilisation.
+  function renderMoneyHoldingBanner(){
+    var c = entitlementCushionStatus();
+    var pending = pendingEntitlementPaymentAmount();
+    var headcount = activeEmployeeCount();
+    var pctLabel = c.planned>0 ? Math.round(c.utilisation*100)+'%' : '&mdash;';
+    var utilColor = (c.planned>0 && c.belowThreshold) ? 'var(--danger)' : 'var(--success)';
+    var pendingColor = pending>0 ? 'var(--danger)' : 'var(--text)';
+    var item = function(label, value, color){
+      return '<div class="money-banner-item"><span class="money-banner-label">'+label+'</span>'+
+        '<span class="money-banner-value" style="'+(color?('color:'+color+';'):'')+'">'+value+'</span></div>';
+    };
+    return '<div class="money-banner">'+
+        item('Money Holding', fmtMoney(c.holding))+
+        item('Entitlement', fmtMoney(c.planned))+
+        item('Pending Payment', fmtMoney(pending), pendingColor)+
+        item('Head Count', String(headcount))+
+        item('Utilisation', pctLabel, utilColor)+
+      '</div>';
+  }
+
+  // Second, smaller strip right under the money banner - only rendered
+  // when there's actually something to do, so it doesn't clutter every
+  // screen when things are quiet. Pulls together two counts that already
+  // exist as nav badges (Pending Approvals, and the New Hire Invoicing
+  // reminder once utilisation crosses 80%) so neither requires clicking
+  // into its own tab just to notice it's there. Each chip jumps straight
+  // to the screen that handles it.
+  function renderActionItemsBanner(){
+    var pendingApprovals = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
+    var invoicingReminder = entitlementCushionStatus().reminderCount;
+    if(!pendingApprovals && !invoicingReminder) return '';
+    var chips = '';
+    if(pendingApprovals){
+      chips += '<button class="action-chip" data-action="nav" data-tab="approvals">'+pendingApprovals+' claim'+(pendingApprovals===1?'':'s')+' awaiting approval</button>';
+    }
+    if(invoicingReminder){
+      chips += '<button class="action-chip" data-action="goto-newhire-invoicing">'+invoicingReminder+' item'+(invoicingReminder===1?'':'s')+' ready to invoice (utilisation &ge; 80%)</button>';
+    }
+    return '<div class="action-banner"><span class="action-banner-label">Needs attention</span>'+chips+'</div>';
   }
 
   // Applies this item's Prorate checkbox and any Waive/Override choice to
@@ -1657,6 +1726,8 @@
     var financeReminderCount = entitlementCushionStatus().reminderCount + unpaidEntitlementInvoices().length;
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
+      renderMoneyHoldingBanner()+
+      renderActionItemsBanner()+
       '<div class="tabs">'+
         navTab('approvals','Pending Approvals'+(pendingCount?' <span class="badge">'+pendingCount+'</span>':''))+
         navTab('all','All Submissions')+
@@ -3625,6 +3696,11 @@
           return loadAppData().then(function(){ render(); }).catch(function(err){ console.error('dashboard refresh failed', err); });
         }
         return Promise.resolve();
+      // Jumps straight to the New Hire Invoicing sub-tab from the action
+      // banner's "ready to invoice" chip - a plain 'nav' only sets the
+      // top-level tab, so Finance's own sub-tab needs setting too or it'd
+      // land on Annual Invoice instead.
+      case 'goto-newhire-invoicing': STATE.activeTab='finance'; STATE.financeSubTab='newhire'; render(); return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
       case 'buy-travel-insurance': window.open('https://sg-customer.qbe.com/travel/partner/01000960', '_blank', 'noopener,noreferrer'); return Promise.resolve();
