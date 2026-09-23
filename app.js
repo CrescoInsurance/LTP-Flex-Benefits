@@ -72,6 +72,8 @@
     reportSearchQuery: '',
     reportSortColumn: null,
     reportSortDirection: 'desc',
+    reportExpandedEmployees: {}, // employeeId -> true, for the "By Employee" claim-detail expand/hide toggle
+    pdfIncludeClaimDetails: false, // "Include claim details" checkbox next to Export to PDF for HR
     rejectedSearchQuery: '',
     rejectedSortColumn: null,
     rejectedSortDirection: 'desc',
@@ -80,6 +82,8 @@
     financeSubTab: null, // 'annual' | 'newhire' | 'history' - sub-tab within the Finance module
     editingInvoiceRate: false,
     editingClientName: false,
+    editingBenefitYearStart: false,
+    reportViewMode: 'benefit', // 'benefit' (default) | 'calendar' - Monthly Utilisation Report period picker
     editingWaiverLine: null, // 'headcountAdjustment' | 'baseHeadcountCharge' | null
     appSettings: {},
     _realtimeSubscribed: false,
@@ -235,7 +239,80 @@
   function fmtDateTime(iso){ if(!iso) return '-'; var dt=new Date(iso); if(isNaN(dt)) return iso; return dt.toLocaleString(undefined,{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
   function escapeHtml(str){ return String(str==null?'':str).replace(/[&<>"']/g, function(s){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]; }); }
   function todayStr(){ return new Date().toISOString().slice(0,10); }
-  function yearStartStr(){ return new Date().getFullYear()+'-01-01'; }
+  function pad2(n){ return n<10 ? '0'+n : ''+n; }
+  var REPORT_MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+  /* ---------------------------------------------------------------------
+     BENEFIT YEAR (configurable start month)
+     -----------------------------------------------------------------------
+     Historically every "year" in this app meant literal calendar Jan-Dec.
+     benefit_year_start_month (app_settings, default 1 = January) lets a
+     client run their entitlement/invoicing cycle on any 12-month window
+     instead - e.g. starting 1 Oct. A "benefit year" is labeled by the
+     calendar year it STARTS in, so with an Oct start, "Benefit Year 2026"
+     runs 1 Oct 2026 - 30 Sep 2027. When the start month is left at January
+     (the default, and LTP's own current setting), every helper below
+     reduces exactly to the old calendar-year math - nothing changes for a
+     client that never touches this setting.
+  --------------------------------------------------------------------- */
+  function benefitYearStartMonth(){
+    var m = parseInt(STATE.appSettings && STATE.appSettings.benefit_year_start_month, 10);
+    return (m>=1 && m<=12) ? m : 1;
+  }
+  function lastDayOfMonth(year, month){ return new Date(year, month, 0).getDate(); }
+  function benefitYearBounds(byYear){
+    var m = benefitYearStartMonth();
+    var endYear = (m===1) ? byYear : byYear+1;
+    var endMonth = (m===1) ? 12 : (m-1);
+    return {
+      startStr: byYear+'-'+pad2(m)+'-01',
+      endStr: endYear+'-'+pad2(endMonth)+'-'+pad2(lastDayOfMonth(endYear, endMonth)),
+      startMonth: m, startYear: byYear, endMonth: endMonth, endYear: endYear
+    };
+  }
+  // Which benefit year label a given date falls into.
+  function benefitYearForDate(dateStr){
+    if(!dateStr) return null;
+    var m = benefitYearStartMonth();
+    var y = Number(dateStr.slice(0,4)), mo = Number(dateStr.slice(5,7));
+    return (mo>=m) ? y : y-1;
+  }
+  function currentBenefitYear(){ return benefitYearForDate(todayStr()); }
+  // 1-12 slot position of a date's month within its own benefit year
+  // (slot 1 = the configured start month) - used for whole-month proration,
+  // same idea as counting calendar months 1-12 but re-based to start month.
+  function monthSlotOf(dateStr){
+    var m = benefitYearStartMonth();
+    var mo = Number(dateStr.slice(5,7));
+    return ((mo - m + 12) % 12) + 1;
+  }
+  function fmtDateDMY(dateStr){
+    var dt = new Date(dateStr+'T00:00:00');
+    return dt.getDate()+' '+REPORT_MONTH_NAMES[dt.getMonth()].slice(0,3)+' '+dt.getFullYear();
+  }
+  // Pure UTC date math throughout (construct with Date.UTC, advance with
+  // setUTCDate, read back with toISOString) - mixing a local-time
+  // construction with a UTC read (as new Date(str+'T00:00:00') + a plain
+  // .setDate()/.toISOString() would) silently shifts the result back a day
+  // for anyone west of UTC... which includes Singapore, GMT+8, where this
+  // app actually runs. Keeping it all-UTC sidesteps that entirely.
+  function addDaysToDateStr(dateStr, days){
+    var parts = dateStr.split('-').map(Number);
+    var d = new Date(Date.UTC(parts[0], parts[1]-1, parts[2]));
+    d.setUTCDate(d.getUTCDate()+days);
+    return d.toISOString().slice(0,10);
+  }
+  // Human label for a benefit year: just the bare year when the start
+  // month is January (so a client on the default setting - LTP included -
+  // reads exactly what they always have), or "Benefit Year YYYY (Mon YYYY
+  // - Mon YYYY)" once a client is on a custom start month.
+  function benefitYearLabel(byYear){
+    if(benefitYearStartMonth()===1) return String(byYear);
+    var b = benefitYearBounds(byYear);
+    return 'Benefit Year '+byYear+' ('+REPORT_MONTH_NAMES[b.startMonth-1].slice(0,3)+' '+b.startYear+' - '+REPORT_MONTH_NAMES[b.endMonth-1].slice(0,3)+' '+b.endYear+')';
+  }
+  function benefitYearResetLabel(){ return '1 '+REPORT_MONTH_NAMES[benefitYearStartMonth()-1]; }
+  function yearStartStr(){ return benefitYearBounds(currentBenefitYear()).startStr; }
   function isImageName(name){ return /\.(png|jpe?g|gif|webp|heic|heif|bmp)$/i.test(name||''); }
 
   function profileById(id){ return STATE.profiles.filter(function(p){ return p.id===id; })[0]; }
@@ -306,9 +383,9 @@
 
   function computeWallet(employeeId){
     var profile = profileById(employeeId) || {annual_allocation:0};
-    var currentYear = new Date().getFullYear();
+    var currentYear = currentBenefitYear();
     var empClaims = STATE.claims.filter(function(c){
-      return c.employee_id===employeeId && new Date(c.receipt_date+'T00:00:00').getFullYear()===currentYear;
+      return c.employee_id===employeeId && c.receipt_date && benefitYearForDate(c.receipt_date)===currentYear;
     });
     var approvedTotal=0, pendingTotal=0;
     var byCategory = {};
@@ -319,12 +396,13 @@
       if(c.status==='approved'){ approvedTotal+=amt; byCategory[c.category].approved+=amt; }
       if(c.status==='pending'){ pendingTotal+=amt; byCategory[c.category].pending+=amt; }
     });
-    // Prorate the wallet cap for an employee's own partial first year, the
-    // same way New Hire Invoicing prorates what the client gets billed --
-    // reuses proratedAllocationForYear() so the two never drift apart.
-    // monthsEmployedInYear() already returns 12 (full year) for any year
-    // after the join year on its own, so this naturally reverts to the full
-    // annual_allocation from next January without any reset job.
+    // Prorate the wallet cap for an employee's own partial first benefit
+    // year, the same way New Hire Invoicing prorates what the client gets
+    // billed -- reuses proratedAllocationForYear() so the two never drift
+    // apart. monthsEmployedInYear() already returns 12 (full year) for any
+    // benefit year after the join year on its own, so this naturally
+    // reverts to the full annual_allocation from the next benefit year
+    // start without any reset job.
     var allocation = (profile.prorate_entitlement_default!==false)
       ? proratedAllocationForYear(profile, currentYear)
       : (Number(profile.annual_allocation)||0);
@@ -347,11 +425,19 @@
       totalClaimed+=amt;
       byCategory[c.category] = byCategory[c.category]||{count:0,total:0};
       byCategory[c.category].count++; byCategory[c.category].total+=amt;
-      byEmployee[c.employee_id] = byEmployee[c.employee_id]||{count:0,total:0,name:employeeName(c.employee_id),categories:{}};
+      byEmployee[c.employee_id] = byEmployee[c.employee_id]||{count:0,total:0,name:employeeName(c.employee_id),categories:{},claims:[]};
       byEmployee[c.employee_id].count++; byEmployee[c.employee_id].total+=amt;
       byEmployee[c.employee_id].categories[c.category] = byEmployee[c.employee_id].categories[c.category]||{count:0,total:0};
       byEmployee[c.employee_id].categories[c.category].count++;
       byEmployee[c.employee_id].categories[c.category].total+=amt;
+      // Individual claim line, kept alongside the category rollup above so
+      // the "By Employee" report can show either the aggregated total per
+      // category (default table) or every claim one-by-one (the expandable
+      // on-screen detail, and the optional PDF claim breakdown).
+      byEmployee[c.employee_id].claims.push({category:c.category, receiptDate:c.receipt_date, amount:amt});
+    });
+    Object.keys(byEmployee).forEach(function(empId){
+      byEmployee[empId].claims.sort(function(a,b){ return a.receiptDate.localeCompare(b.receiptDate); });
     });
 
     var totalRejected = 0;
@@ -381,8 +467,9 @@
 
   /* =========================================================
      ANNUAL INVOICE (Headcount Adjustment + Unutilised Credit Note)
-     Principle: adjustment = (headcount at 31 Dec - headcount at 1 Jan) / 2,
-     charged (or credited if negative) at the configured rate per head per year.
+     Principle: adjustment = (headcount at benefit-year end - headcount at
+     benefit-year start) / 2, charged (or credited if negative) at the
+     configured rate per head per year.
      Any amount not utilised by employees for the year is credited back via
      credit note, as is any negative headcount adjustment. Net amount =
      additional headcount charge minus total credit note.
@@ -398,8 +485,7 @@
   }
 
   function getSelectedInvoiceYear(){
-    var now = new Date();
-    return (STATE.invoiceYear!=null) ? STATE.invoiceYear : (now.getFullYear()-1);
+    return (STATE.invoiceYear!=null) ? STATE.invoiceYear : (currentBenefitYear()-1);
   }
 
   function getClientCode(){
@@ -450,12 +536,12 @@
   }
 
   function buildInvoiceYearOptions(){
-    var now = new Date();
+    var cby = currentBenefitYear();
     var years = {};
-    years[now.getFullYear()] = true;
-    years[now.getFullYear()-1] = true;
-    STATE.profiles.forEach(function(p){ if(p.effective_date){ years[parseInt(p.effective_date.slice(0,4),10)]=true; } });
-    STATE.claims.forEach(function(c){ if(c.receipt_date){ years[parseInt(c.receipt_date.slice(0,4),10)]=true; } });
+    years[cby] = true;
+    years[cby-1] = true;
+    STATE.profiles.forEach(function(p){ if(p.effective_date){ years[benefitYearForDate(p.effective_date)]=true; } });
+    STATE.claims.forEach(function(c){ if(c.receipt_date){ years[benefitYearForDate(c.receipt_date)]=true; } });
     return Object.keys(years).map(Number).sort(function(a,b){ return b-a; });
   }
 
@@ -471,19 +557,19 @@
   // Anyone who joined before this year and has no termination this year (or
   // has neither date on file) counts as a full 12 months.
   function monthsEmployedInYear(p, year){
-    var startMonth = 1;
+    var startSlot = 1;
     if(p.effective_date){
-      var effYear = Number(p.effective_date.slice(0,4));
-      if(effYear === year){ startMonth = Number(p.effective_date.slice(5,7)); }
-      else if(effYear > year){ return 0; }
+      var effBY = benefitYearForDate(p.effective_date);
+      if(effBY === year){ startSlot = monthSlotOf(p.effective_date); }
+      else if(effBY > year){ return 0; }
     }
-    var endMonth = 12;
+    var endSlot = 12;
     if(p.date_of_termination){
-      var termYear = Number(p.date_of_termination.slice(0,4));
-      if(termYear === year){ endMonth = Number(p.date_of_termination.slice(5,7)); }
-      else if(termYear < year){ return 0; }
+      var termBY = benefitYearForDate(p.date_of_termination);
+      if(termBY === year){ endSlot = monthSlotOf(p.date_of_termination); }
+      else if(termBY < year){ return 0; }
     }
-    return Math.max(0, endMonth - startMonth + 1);
+    return Math.max(0, endSlot - startSlot + 1);
   }
   function proratedAllocationForYear(p, year){
     var annualAlloc = Number(p.annual_allocation)||0;
@@ -507,8 +593,8 @@
   // effective-date month itself as a full month - same whole-month rule as
   // a new joiner, just measured from the change date instead of a hire date.
   function monthsFromDateToYearEnd(dateStr){
-    var month = Number(dateStr.slice(5,7));
-    return 12 - month + 1;
+    var slot = monthSlotOf(dateStr);
+    return 12 - slot + 1;
   }
 
   function hasAnyIssuedEntitlementInvoice(){
@@ -528,7 +614,7 @@
       var inv = issuedInvoiceIds[item.invoice_id];
       if(!inv) return;
       if(item.item_type!=='new_hire' && item.item_type!=='initial_roster') return;
-      var yr = Number(item.effective_date.slice(0,4));
+      var yr = benefitYearForDate(item.effective_date);
       var key = item.employee_id+'|'+yr;
       if(!map[key]) map[key] = [];
       map[key].push({item:item, invoice:inv});
@@ -546,7 +632,7 @@
       if(item.item_type!=='promotion') return;
       if(!issuedInvoiceIds[item.invoice_id]) return;
       if(item.employee_id!==employeeId) return;
-      if(Number(item.effective_date.slice(0,4))!==year) return;
+      if(benefitYearForDate(item.effective_date)!==year) return;
       total += Number(item.final_amount)||0;
     });
     return total;
@@ -581,7 +667,7 @@
     var items = [];
     STATE.profiles.forEach(function(p){
       if(p.role!=='user' || !p.effective_date) return;
-      var year = Number(p.effective_date.slice(0,4));
+      var year = benefitYearForDate(p.effective_date);
       if(billedMap[p.id+'|'+year]) return; // already invoiced for this year
       var months = monthsEmployedInYear(p, year);
       var prorated = proratedAllocationForYear(p, year);
@@ -742,7 +828,17 @@
       return '<div class="money-banner-item"><span class="money-banner-label">'+label+'</span>'+
         '<span class="money-banner-value" style="'+(color?('color:'+color+';'):'')+'">'+value+'</span></div>';
     };
-    return '<div class="money-banner">'+
+    // Read-only reminder of which 12-month cycle these figures are being
+    // measured against - shown on every admin screen (not just Finance,
+    // where the actual Edit control lives) since Employee Management,
+    // Reports and the wallet math all depend on it too. This is a
+    // one-time client setup decision (edited via the Client Setup strip
+    // on Finance > Annual Invoice), so it's shown here as plain text,
+    // with no link back, to avoid implying it's something to change often.
+    var byBounds = benefitYearBounds(currentBenefitYear());
+    var cycleCaption = '<div class="money-banner-caption">Benefit Year: '+fmtDateDMY(byBounds.startStr)+' - '+fmtDateDMY(byBounds.endStr)+'</div>';
+    return cycleCaption+
+      '<div class="money-banner">'+
         item('Money Holding', fmtMoney(c.holding))+
         item('Entitlement', fmtMoney(c.planned))+
         item('Pending Payment', fmtMoney(pending), pendingColor)+
@@ -901,8 +997,9 @@
   }
 
   function computeAnnualInvoice(year){
-    var startStr = year+'-01-01';
-    var endStr = year+'-12-31';
+    var bounds = benefitYearBounds(year);
+    var startStr = bounds.startStr;
+    var endStr = bounds.endStr;
     var rate = getInvoiceRate();
 
     // An employee with no Effective Date recorded is treated as already
@@ -936,7 +1033,7 @@
       if(item.item_type!=='new_hire' && item.item_type!=='initial_roster') return;
       var inv = STATE.entitlementInvoices.filter(function(i){ return i.id===item.invoice_id && i.status==='issued'; })[0];
       if(!inv || inv.invoice_type!=='initial') return;
-      initialRosterEmployeeYears[item.employee_id] = Number(item.effective_date.slice(0,4));
+      initialRosterEmployeeYears[item.employee_id] = benefitYearForDate(item.effective_date);
     });
     var isExcludedFromTrueUp = function(p){ return initialRosterEmployeeYears[p.id]===year; };
 
@@ -960,7 +1057,7 @@
     // Any promotion invoiced for them this year is added on top either way.
     var billedMap = issuedEntitlementItemsByEmployeeYear();
     var billedAllocationAndTrace = function(p){
-      var joinYear = p.effective_date ? Number(p.effective_date.slice(0,4)) : null;
+      var joinYear = p.effective_date ? benefitYearForDate(p.effective_date) : null;
       var billedEntry = billedMap[p.id+'|'+year];
       var allocation, invoiceNumber = null, months = monthsEmployedInYear(p, year);
       if(billedEntry && billedEntry.length){
@@ -996,12 +1093,12 @@
     var netAmount = additionalCharge - creditNoteAmount;
 
     // Base Headcount Charge: the invoice also needs to bill for the upcoming
-    // year's headcount as at 1 Jan (the year the invoice is dated), on top of
-    // the true-up adjustment for the year just closed. This always counts
-    // everyone currently on the books, including anyone from an Initial
-    // Invoice - that fee only ever covered their onboarding year, not every
-    // year going forward.
-    var newYearStr = (year+1)+'-01-01';
+    // benefit year's headcount as at its start date (the day the invoice is
+    // dated), on top of the true-up adjustment for the year just closed.
+    // This always counts everyone currently on the books, including anyone
+    // from an Initial Invoice - that fee only ever covered their onboarding
+    // year, not every year going forward.
+    var newYearStr = benefitYearBounds(year+1).startStr;
     var newYearHeadcount = headcountAt(newYearStr);
     var baseHeadcountCharge = newYearHeadcount * rate;
     var totalHeadcountCharge = baseHeadcountCharge + adjustmentAmount;
@@ -1156,37 +1253,110 @@
     claims.forEach(function(c){ if(c.receipt_date){ years[new Date(c.receipt_date+'T00:00:00').getFullYear()]=true; } });
     return Object.keys(years).map(Number).sort(function(a,b){ return b-a; });
   }
+  function uniqueBenefitYearsFromClaims(claims, currentBY){
+    var years = {}; years[currentBY]=true;
+    claims.forEach(function(c){ if(c.receipt_date){ years[benefitYearForDate(c.receipt_date)]=true; } });
+    return Object.keys(years).map(Number).sort(function(a,b){ return b-a; });
+  }
 
-  var REPORT_MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  // The Monthly Utilisation Report can be viewed two ways: following the
+  // client's Benefit Year (default - matches how entitlement/invoicing
+  // actually works), or plain Jan-Dec calendar months, for an HR team that
+  // prefers to see it that way regardless of when the benefit year starts.
+  // When the benefit year IS January-started, the two views are identical,
+  // so the toggle only ever shows up once a client is on a custom month.
+  function reportViewMode(){ return STATE.reportViewMode==='calendar' ? 'calendar' : 'benefit'; }
+  // 12 real calendar month indices (0-11), in the order this view displays
+  // them - starting at the configured benefit-year month, wrapping into the
+  // next calendar year. In calendar mode (or a January start) this is just
+  // [0,1,2...11], same as always.
+  function reportMonthSequence(){
+    if(reportViewMode()==='calendar') return [0,1,2,3,4,5,6,7,8,9,10,11];
+    var startMo = benefitYearStartMonth()-1;
+    var seq = [];
+    for(var i=0;i<12;i++){ seq.push((startMo+i)%12); }
+    return seq;
+  }
+  function defaultReportMonthSlot(){
+    var now = new Date();
+    if(reportViewMode()==='calendar') return now.getMonth();
+    return reportMonthSequence().indexOf(now.getMonth());
+  }
+  function currentReportYearValue(){
+    if(STATE.reportYear!=null) return String(STATE.reportYear);
+    return String(reportViewMode()==='calendar' ? new Date().getFullYear() : currentBenefitYear());
+  }
+  function currentReportMonthValue(){
+    return (STATE.reportMonth!=null) ? STATE.reportMonth : defaultReportMonthSlot();
+  }
 
   function buildReportYearOptions(claims){
     var now = new Date();
-    var currentYear = now.getFullYear();
-    var options = [{value:String(currentYear), label:String(currentYear)},
-      {value:'ytd', label:'Year to Date '+currentYear+' ('+REPORT_MONTH_NAMES[0].slice(0,3)+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')'}];
-    uniqueYearsFromClaims(claims, currentYear).filter(function(yr){ return yr!==currentYear; }).forEach(function(yr){
-      options.push({value:String(yr), label:String(yr)});
+    if(reportViewMode()==='calendar'){
+      var currentYear = now.getFullYear();
+      var options = [{value:String(currentYear), label:String(currentYear)},
+        {value:'ytd', label:'Year to Date '+currentYear+' ('+REPORT_MONTH_NAMES[0].slice(0,3)+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')'}];
+      uniqueYearsFromClaims(claims, currentYear).filter(function(yr){ return yr!==currentYear; }).forEach(function(yr){
+        options.push({value:String(yr), label:String(yr)});
+      });
+      return options;
+    }
+    var currentBY = currentBenefitYear();
+    var startName = REPORT_MONTH_NAMES[benefitYearStartMonth()-1].slice(0,3);
+    var options = [{value:String(currentBY), label: benefitYearLabel(currentBY)},
+      {value:'ytd', label:'Benefit-Year to Date ('+startName+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')'}];
+    uniqueBenefitYearsFromClaims(claims, currentBY).filter(function(by){ return by!==currentBY; }).forEach(function(by){
+      options.push({value:String(by), label: benefitYearLabel(by)});
     });
     return options;
   }
 
   function resolveReportPeriod(yearValue, monthValue){
+    var mode = reportViewMode();
     var now = new Date();
     if(yearValue==='ytd'){
+      if(mode==='calendar'){
+        return {
+          startDate: new Date(now.getFullYear(),0,1,0,0,0),
+          endDate: now,
+          label: 'Year to Date '+now.getFullYear()+' ('+REPORT_MONTH_NAMES[0].slice(0,3)+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')',
+          fileSuffix: now.getFullYear()+'-YTD'
+        };
+      }
+      var by = currentBenefitYear();
+      var bounds = benefitYearBounds(by);
+      var startName = REPORT_MONTH_NAMES[benefitYearStartMonth()-1].slice(0,3);
       return {
-        startDate: new Date(now.getFullYear(),0,1,0,0,0),
+        startDate: new Date(bounds.startStr+'T00:00:00'),
         endDate: now,
-        label: 'Year to Date '+now.getFullYear()+' ('+REPORT_MONTH_NAMES[0].slice(0,3)+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')',
-        fileSuffix: now.getFullYear()+'-YTD'
+        label: 'Benefit-Year to Date ('+startName+'-'+REPORT_MONTH_NAMES[now.getMonth()].slice(0,3)+')',
+        fileSuffix: by+'-BYTD'
       };
     }
-    var yr = parseInt(yearValue,10); if(isNaN(yr)) yr = now.getFullYear();
-    var mo = parseInt(monthValue,10); if(isNaN(mo)) mo = now.getMonth();
+    if(mode==='calendar'){
+      var yr = parseInt(yearValue,10); if(isNaN(yr)) yr = now.getFullYear();
+      var mo = parseInt(monthValue,10); if(isNaN(mo)) mo = now.getMonth();
+      return {
+        startDate: new Date(yr,mo,1,0,0,0),
+        endDate: new Date(yr,mo+1,0,23,59,59),
+        label: REPORT_MONTH_NAMES[mo]+' '+yr,
+        fileSuffix: yr+'-'+pad2(mo+1)
+      };
+    }
+    // Benefit-year mode: yearValue is a benefit-year label, monthValue is a
+    // slot index (0-11) into reportMonthSequence() - resolve both back to
+    // the real calendar month/year the report actually needs to query.
+    var byYr = parseInt(yearValue,10); if(isNaN(byYr)) byYr = currentBenefitYear();
+    var slot = parseInt(monthValue,10); if(isNaN(slot)) slot = 0;
+    var seq = reportMonthSequence();
+    var actualMonth = seq[slot];
+    var startMo0 = benefitYearStartMonth()-1;
+    var actualYear = (actualMonth >= startMo0) ? byYr : byYr+1;
     return {
-      startDate: new Date(yr,mo,1,0,0,0),
-      endDate: new Date(yr,mo+1,0,23,59,59),
-      label: REPORT_MONTH_NAMES[mo]+' '+yr,
-      fileSuffix: yr+'-'+String(mo+1).padStart(2,'0')
+      startDate: new Date(actualYear, actualMonth, 1,0,0,0),
+      endDate: new Date(actualYear, actualMonth+1, 0,23,59,59),
+      label: REPORT_MONTH_NAMES[actualMonth]+' '+actualYear,
+      fileSuffix: actualYear+'-'+pad2(actualMonth+1)
     };
   }
 
@@ -1562,7 +1732,7 @@
         '<div class="muted small">Available balance: '+fmtMoney(wallet.available)+' (SGD)</div>'+
         '<div id="claim-amount-live-error" class="field-error" style="display:none;"></div>'+
         '<label>Date of Receipt<input type="date" name="receiptDate" required min="'+yearStartStr()+'" max="'+todayStr()+'" /></label>'+
-        '<div class="field-hint">Only receipts from '+new Date().getFullYear()+' can be claimed - your benefits reset every 1 January.</div>'+
+        '<div class="field-hint">Only receipts from '+fmtDateDMY(yearStartStr())+' onward can be claimed this cycle - your benefits reset every '+benefitYearResetLabel()+'.</div>'+
         '<label>Upload Receipt (photo or PDF, max 4MB)</label>'+
         '<div class="dropzone" id="claim-receipt-dropzone">'+
           '<input type="file" name="receipt" accept="image/*,.pdf" required />'+
@@ -1696,7 +1866,7 @@
       '<div id="edit-amount-preview-'+c.id+'" class="tiny muted"></div>'+
       '<div id="edit-amount-live-error-'+c.id+'" class="field-error" style="display:none;"></div>'+
       '<label>Receipt Date<input type="date" id="edit-date-'+c.id+'" value="'+c.receipt_date+'" min="'+yearStartStr()+'" max="'+todayStr()+'"/></label>'+
-      '<div class="field-hint">Only receipts from '+new Date().getFullYear()+' can be claimed - your benefits reset every 1 January.</div>'+
+      '<div class="field-hint">Only receipts from '+fmtDateDMY(yearStartStr())+' onward can be claimed this cycle - your benefits reset every '+benefitYearResetLabel()+'.</div>'+
       '<label>Replace Receipt (optional)</label>'+
       '<div class="dropzone" id="edit-receipt-dropzone-'+c.id+'">'+
         '<input type="file" id="edit-receipt-'+c.id+'" accept="image/*,.pdf"/>'+
@@ -1759,7 +1929,11 @@
     var subTabBtn = function(key, label){
       return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
     };
-    return '<div class="tabs" style="margin-bottom:16px;">'+
+    var clientSetupStrip = STATE.editingBenefitYearStart
+      ? ('<div class="field-hint" style="margin-bottom:14px;">Client Setup &middot; Benefit Year starts: <select id="benefit-year-start-input">'+REPORT_MONTH_NAMES.map(function(mn,i){ return '<option value="'+(i+1)+'" '+((i+1)===benefitYearStartMonth()?'selected':'')+'>'+mn+'</option>'; }).join('')+'</select> <button class="btn btn-sm btn-primary" data-action="save-benefit-year-start">Save</button></div>')
+      : ('<div class="field-hint" style="margin-bottom:14px;">Client Setup &middot; Benefit Year starts: '+REPORT_MONTH_NAMES[benefitYearStartMonth()-1]+' <button class="link-btn" data-action="edit-benefit-year-start">Edit</button></div>');
+    return clientSetupStrip+
+      '<div class="tabs" style="margin-bottom:16px;">'+
         subTabBtn('annual','Annual Invoice')+
         subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
         subTabBtn('history','Invoice History'+(unpaidCount?' <span class="badge">'+unpaidCount+'</span>':''))+
@@ -1920,8 +2094,12 @@
     }).join('');
 
     var mode = STATE.addEmployeeMode || 'single';
+    var byBounds = benefitYearBounds(currentBenefitYear());
+    var benefitYearNote = '<div class="field-hint" style="margin-bottom:14px;">Benefit Year runs '+fmtDateDMY(byBounds.startStr)+' - '+fmtDateDMY(byBounds.endStr)+
+      ' (starts '+REPORT_MONTH_NAMES[benefitYearStartMonth()-1]+') - Effective Dates and proration below are measured against this cycle.</div>';
 
     return ''+
+    benefitYearNote+
     '<div class="card"><div class="card-title">Add Employee</div>'+
       '<div class="filter-row" style="margin-bottom:12px;">'+
         '<button type="button" class="chip-filter '+(mode==='single'?'active':'')+'" data-action="set-add-employee-mode" data-mode="single">Employee Only</button>'+
@@ -2050,11 +2228,13 @@
 
   function renderAdminFinance(){
     var year = getSelectedInvoiceYear();
+    var bounds = benefitYearBounds(year);
+    var nextBounds = benefitYearBounds(year+1);
     var yearOptions = buildInvoiceYearOptions();
     var issuedAnnual = STATE.annualInvoices.filter(function(a){ return a.year===year && a.status==='issued'; })[0];
     var isIssuedView = !!(issuedAnnual && issuedAnnual.snapshot_json);
     var inv = isIssuedView ? issuedAnnual.snapshot_json : applyAnnualWaivers(computeAnnualInvoice(year));
-    var invoiceDate = '2 Jan '+(year+1);
+    var invoiceDate = fmtDateDMY(addDaysToDateStr(bounds.endStr, 2));
     var invoiceNoLabel = isIssuedView ? ('Invoice No: '+escapeHtml(issuedAnnual.invoice_number)+' (issued '+fmtDate(issuedAnnual.issued_at.slice(0,10))+')') : 'Invoice No: assigned on Issue';
 
     var rateCell = isIssuedView ? '<span class="muted">Rate used: '+fmtMoney(inv.rate)+' / head / year</span>'
@@ -2080,11 +2260,11 @@
       '<div class="card-title-row">'+
         '<div class="card-title">Annual Invoice</div>'+
         '<div class="report-controls" style="margin-bottom:0;">'+
-          '<select data-action="set-invoice-year">'+yearOptions.map(function(y){ return '<option value="'+y+'" '+(y===year?'selected':'')+'>'+y+'</option>'; }).join('')+'</select>'+
+          '<select data-action="set-invoice-year">'+yearOptions.map(function(y){ return '<option value="'+y+'" '+(y===year?'selected':'')+'>'+escapeHtml(benefitYearLabel(y))+'</option>'; }).join('')+'</select>'+
           actionButtons+
         '</div>'+
       '</div>'+
-      '<div class="report-summary" style="margin-bottom:16px;">Period: 1 Jan '+year+' - 31 Dec '+year+' &middot; Invoice date '+invoiceDate+' &middot; '+invoiceNoLabel+' &middot; '+rateCell+
+      '<div class="report-summary" style="margin-bottom:16px;">Period: '+fmtDateDMY(bounds.startStr)+' - '+fmtDateDMY(bounds.endStr)+' &middot; Invoice date '+invoiceDate+' &middot; '+invoiceNoLabel+' &middot; '+rateCell+
         (isIssuedView?'':' <span class="tiny muted">&middot; Preview only - nothing is saved until you Issue</span>')+
         (precedingVoidedAnnual ? (' <span class="tiny" style="color:var(--accent-dark);">&middot; Issuing now will supersede voided invoice '+escapeHtml(precedingVoidedAnnual.invoice_number)+'</span>') : '')+
       '</div>'+
@@ -2099,10 +2279,10 @@
     '</div>'+
     '<div class="card">'+
       '<div class="card-title">Calculation Detail</div>'+
-      '<details open><summary class="link-btn" style="cursor:pointer;">Headcount Adjustment (True-Up for '+year+')</summary>'+
+      '<details open><summary class="link-btn" style="cursor:pointer;">Headcount Adjustment (True-Up for '+benefitYearLabel(year)+')</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table"><tbody>'+
-          '<tr><td>Headcount as at 1 Jan '+year+'</td><td>'+inv.startHeadcount+'</td></tr>'+
-          '<tr><td>Headcount as at 31 Dec '+year+'</td><td>'+inv.endHeadcount+'</td></tr>'+
+          '<tr><td>Headcount as at '+fmtDateDMY(bounds.startStr)+'</td><td>'+inv.startHeadcount+'</td></tr>'+
+          '<tr><td>Headcount as at '+fmtDateDMY(bounds.endStr)+'</td><td>'+inv.endHeadcount+'</td></tr>'+
           '<tr><td>Net Change</td><td>'+inv.headcountDelta+'</td></tr>'+
           '<tr><td>Adjustment Units (Net Change &divide; 2)</td><td>'+inv.adjustmentUnits+'</td></tr>'+
           '<tr><td>Rate per Headcount</td><td>'+fmtMoney(inv.rate)+'</td></tr>'+
@@ -2111,9 +2291,9 @@
             : waiverLineHtml('headcountAdjustment','Headcount Adjustment Amount', computeAnnualInvoice(year).adjustmentAmount, inv))+
         '</tbody></table></div>'+
       '</details>'+
-      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Headcount Charge for '+(year+1)+' ('+inv.newYearHeadcount+' employees)</summary>'+
+      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Headcount Charge for '+benefitYearLabel(year+1)+' ('+inv.newYearHeadcount+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table"><tbody>'+
-          '<tr><td>Headcount as at 1 Jan '+(year+1)+'</td><td>'+inv.newYearHeadcount+'</td></tr>'+
+          '<tr><td>Headcount as at '+fmtDateDMY(nextBounds.startStr)+'</td><td>'+inv.newYearHeadcount+'</td></tr>'+
           '<tr><td>Rate per Headcount</td><td>'+fmtMoney(inv.rate)+'</td></tr>'+
           (isIssuedView
             ? '<tr><td><strong>Base Headcount Charge</strong></td><td><strong>'+fmtMoney(inv.baseHeadcountCharge)+'</strong>'+(inv.baseWaiver&&inv.baseWaiver.status!=='normal'?' <span class="tiny muted">('+inv.baseWaiver.status+(inv.baseWaiver.reason?' - '+escapeHtml(inv.baseWaiver.reason):'')+')</span>':'')+'</td></tr>'
@@ -2122,14 +2302,14 @@
         '</tbody></table></div>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
         '<thead><tr><th>Employee</th><th>Annual Allocation</th></tr></thead>'+
-        '<tbody>'+(inv.newYearHeadcountList.length ? inv.newYearHeadcountList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">No employees on record as at 1 Jan '+(year+1)+'.</td></tr>')+'</tbody></table></div>'+
+        '<tbody>'+(inv.newYearHeadcountList.length ? inv.newYearHeadcountList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">No employees on record as at '+fmtDateDMY(nextBounds.startStr)+'.</td></tr>')+'</tbody></table></div>'+
       '</details>'+
-      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Headcount as at 1 Jan '+year+' ('+inv.startHeadcountList.length+' employees)</summary>'+
+      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">Headcount as at '+fmtDateDMY(bounds.startStr)+' ('+inv.startHeadcountList.length+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
         '<thead><tr><th>Employee</th><th>Annual Allocation</th></tr></thead>'+
-        '<tbody>'+(inv.startHeadcountList.length ? inv.startHeadcountList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">No employees on record as at 1 Jan '+year+'.</td></tr>')+'</tbody></table></div>'+
+        '<tbody>'+(inv.startHeadcountList.length ? inv.startHeadcountList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtMoney(e.allocation)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">No employees on record as at '+fmtDateDMY(bounds.startStr)+'.</td></tr>')+'</tbody></table></div>'+
       '</details>'+
-      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">New Joiners in '+year+' ('+inv.newJoinersList.length+' employees)</summary>'+
+      '<details style="margin-top:12px;"><summary class="link-btn" style="cursor:pointer;">New Joiners in '+benefitYearLabel(year)+' ('+inv.newJoinersList.length+' employees)</summary>'+
         '<div class="table-wrap" style="margin-top:10px;"><table class="data-table">'+
         '<thead><tr><th>Employee</th><th>Effective Date</th><th>Months Billed</th><th>Entitlement</th><th>Invoice #</th></tr></thead>'+
         '<tbody>'+(inv.newJoinersList.length ? inv.newJoinersList.map(function(e){ return '<tr><td>'+escapeHtml(e.name)+'</td><td>'+fmtDate(e.date)+'</td><td>'+e.months+' of 12</td><td>'+fmtMoney(e.allocation)+'</td><td class="tiny muted">'+(e.invoiceNumber?escapeHtml(e.invoiceNumber):'&mdash; (estimated, not yet invoiced)')+'</td></tr>'; }).join('') : '<tr><td colspan="5" class="muted">No new joiners recorded in '+year+'.</td></tr>')+'</tbody></table></div>'+
@@ -2308,9 +2488,8 @@
   }
 
   function renderAdminReports(){
-    var now = new Date();
-    var currentYearValue = (STATE.reportYear!=null) ? String(STATE.reportYear) : String(now.getFullYear());
-    var currentMonthValue = (STATE.reportMonth!=null) ? STATE.reportMonth : now.getMonth();
+    var currentYearValue = currentReportYearValue();
+    var currentMonthValue = currentReportMonthValue();
     var period = resolveReportPeriod(currentYearValue, currentMonthValue);
     var report = buildPeriodReport(STATE.claims, period.startDate, period.endDate);
     var yearOptions = buildReportYearOptions(STATE.claims);
@@ -2320,7 +2499,7 @@
     var categoryScoped = matchedCategories.length > 0;
 
     var empRowData = STATE.profiles.filter(function(p){ return p.role==='user'; }).map(function(p){
-      var r = report.byEmployee[p.id]||{count:0,total:0,categories:{}};
+      var r = report.byEmployee[p.id]||{count:0,total:0,categories:{},claims:[]};
       var allCatKeys = Object.keys(r.categories||{});
       var nameMatches = searchQuery && p.name.toLowerCase().indexOf(searchQuery)!==-1;
       return {p:p, r:r, allCatKeys:allCatKeys, nameMatches:nameMatches};
@@ -2334,17 +2513,35 @@
       var displayCount = 0, displayTotal = 0;
       showCatKeys.forEach(function(cat){ displayCount += row.r.categories[cat].count; displayTotal += row.r.categories[cat].total; });
       var pct = row.p.annual_allocation>0 ? (displayTotal/row.p.annual_allocation*100) : 0;
-      var catBreakdown = showCatKeys.length
-        ? showCatKeys.map(function(cat){ return escapeHtml(cat)+': '+fmtMoney(row.r.categories[cat].total); }).join(', ')
-        : '-';
-      return {name:row.p.name, count:displayCount, total:displayTotal, allocation:row.p.annual_allocation, pct:pct, catBreakdown:catBreakdown};
+      // Same category-search scoping applied to the underlying claim list so
+      // the expandable detail view only ever shows what the summary row's
+      // count/total already reflect - searching "gym" and expanding a match
+      // won't suddenly reveal that employee's unrelated medical claims too.
+      var claims = (categoryScoped && !row.nameMatches)
+        ? (row.r.claims||[]).filter(function(cl){ return showCatKeys.indexOf(cl.category)!==-1; })
+        : (row.r.claims||[]);
+      return {empId:row.p.id, name:row.p.name, count:displayCount, total:displayTotal, allocation:row.p.annual_allocation, pct:pct, claims:claims};
     });
     empRowData = sortRows(empRowData, STATE.reportSortColumn, STATE.reportSortDirection, {
       count: function(r){ return r.count; }, total: function(r){ return r.total; },
       allocation: function(r){ return r.allocation; }, pct: function(r){ return r.pct; }
     });
     var empRows = empRowData.map(function(r){
-      return '<tr><td>'+escapeHtml(r.name)+'</td><td>'+r.count+'</td><td>'+fmtMoney(r.total)+'</td><td>'+fmtMoney(r.allocation)+'</td><td>'+r.pct.toFixed(1)+'%</td><td class="tiny">'+r.catBreakdown+'</td></tr>';
+      var isOpen = !!STATE.reportExpandedEmployees[r.empId];
+      var toggleCell = r.claims.length
+        ? '<button class="link-btn" style="text-decoration:none;" data-action="toggle-report-employee-detail" data-emp-id="'+r.empId+'">'+(isOpen?'▼ Hide':'▶ Details')+'</button>'
+        : '<span class="tiny muted">&mdash;</span>';
+      var mainRow = '<tr><td>'+escapeHtml(r.name)+'</td><td>'+r.count+'</td><td>'+fmtMoney(r.total)+'</td><td>'+fmtMoney(r.allocation)+'</td><td>'+r.pct.toFixed(1)+'%</td><td class="tiny">'+toggleCell+'</td></tr>';
+      if(!isOpen || !r.claims.length) return mainRow;
+      var claimRows = r.claims.map(function(cl, i){
+        return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(cl.category)+'</td><td>'+fmtDateDMY(cl.receiptDate)+'</td><td>'+fmtMoney(cl.amount)+'</td></tr>';
+      }).join('');
+      var detailRow = '<tr class="claim-detail-row"><td colspan="6"><div class="claim-detail-wrap"><table class="claim-detail-table">'+
+        '<thead><tr><th>Claim #</th><th>Category</th><th>Receipt Date</th><th>Amount</th></tr></thead><tbody>'+
+        claimRows+
+        '<tr class="total-row"><td colspan="3">Total &middot; '+r.claims.length+' claim'+(r.claims.length===1?'':'s')+'</td><td>'+fmtMoney(r.total)+'</td></tr>'+
+        '</tbody></table></div></td></tr>';
+      return mainRow+detailRow;
     }).join('');
 
     var rejSearchQuery = (STATE.rejectedSearchQuery||'').trim().toLowerCase();
@@ -2371,12 +2568,19 @@
       ? '<input type="text" maxlength="120" style="width:180px" id="client-name-input" value="'+escapeHtml(getClientCompanyName())+'"/> <button class="btn btn-sm btn-primary" data-action="save-client-name">Save</button>'
       : '<span class="muted">Prepared for: '+escapeHtml(getClientCompanyName())+'</span> <button class="link-btn" data-action="edit-client-name">Edit</button>';
 
+    var currentViewMode = reportViewMode();
+    var viewModeToggle = (benefitYearStartMonth()!==1) ? ('<div class="tiny muted" style="margin-bottom:8px;">View: '+
+        '<button class="link-btn" data-action="set-report-view-mode" data-mode="benefit" style="font-weight:'+(currentViewMode==='benefit'?'700':'400')+';">Benefit Year</button> &middot; '+
+        '<button class="link-btn" data-action="set-report-view-mode" data-mode="calendar" style="font-weight:'+(currentViewMode==='calendar'?'700':'400')+';">Calendar Year (Jan-Dec)</button></div>') : '';
+
     return ''+
     '<div class="card"><div class="card-title">Monthly Utilisation Report</div>'+
+      viewModeToggle+
       '<div class="report-controls">'+
-        '<select data-action="set-report-month" '+(isYtd?'disabled':'')+'>'+REPORT_MONTH_NAMES.map(function(mn,i){ return '<option value="'+i+'" '+(i===currentMonthValue?'selected':'')+'>'+mn+'</option>'; }).join('')+'</select>'+
+        '<select data-action="set-report-month" '+(isYtd?'disabled':'')+'>'+reportMonthSequence().map(function(actualMo,slot){ return '<option value="'+slot+'" '+(slot===currentMonthValue?'selected':'')+'>'+REPORT_MONTH_NAMES[actualMo]+'</option>'; }).join('')+'</select>'+
         '<select data-action="set-report-year">'+yearOptions.map(function(o){ return '<option value="'+o.value+'" '+(o.value===currentYearValue?'selected':'')+'>'+escapeHtml(o.label)+'</option>'; }).join('')+'</select>'+
         '<button class="btn btn-ghost btn-sm" data-action="export-report">Export to Excel</button>'+
+        '<label class="pdf-detail-check"><input type="checkbox" id="pdf-include-details" '+(STATE.pdfIncludeClaimDetails?'checked':'')+'/> Include claim details</label>'+
         '<button class="btn btn-ghost btn-sm" data-action="export-report-pdf">Export to PDF for HR</button>'+
       '</div>'+
       '<div class="field-hint" style="margin:10px 0;">'+clientNameCell+'</div>'+
@@ -2392,7 +2596,7 @@
         '<th class="sortable-th" data-action="sort-report-emp" data-column="total">Amount Claimed'+sortArrow('total',STATE.reportSortColumn,STATE.reportSortDirection)+'</th>'+
         '<th class="sortable-th" data-action="sort-report-emp" data-column="allocation">Entitlement (SGD)'+sortArrow('allocation',STATE.reportSortColumn,STATE.reportSortDirection)+'</th>'+
         '<th class="sortable-th" data-action="sort-report-emp" data-column="pct">Utilisation %'+sortArrow('pct',STATE.reportSortColumn,STATE.reportSortDirection)+'</th>'+
-        '<th>Category Breakdown</th></tr></thead><tbody>'+empRows+'</tbody></table></div>'+
+        '<th>Details</th></tr></thead><tbody>'+empRows+'</tbody></table></div>'+
     '</div>'+
     '<div class="card"><div class="card-title">Rejected Claims</div>'+
       '<input type="text" id="rejected-search-input" class="search-input" placeholder="Search by employee name or reason..." value="'+escapeHtml(STATE.rejectedSearchQuery||'')+'" style="margin-bottom:12px;" />'+
@@ -2437,9 +2641,8 @@
 
   function exportReportExcel(){
     if(typeof XLSX==='undefined'){ showToast('Excel export library did not load (needs an internet connection).', 'error'); return; }
-    var now = new Date();
-    var yearValue = (STATE.reportYear!=null) ? String(STATE.reportYear) : String(now.getFullYear());
-    var monthValue = (STATE.reportMonth!=null) ? STATE.reportMonth : now.getMonth();
+    var yearValue = currentReportYearValue();
+    var monthValue = currentReportMonthValue();
     var period = resolveReportPeriod(yearValue, monthValue);
     var report = buildPeriodReport(STATE.claims, period.startDate, period.endDate);
 
@@ -2478,18 +2681,22 @@
 
   function exportReportPDF(){
     if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){ showToast('PDF export library did not load (needs an internet connection).', 'error'); return; }
-    var now = new Date();
-    var yearValue = (STATE.reportYear!=null) ? String(STATE.reportYear) : String(now.getFullYear());
-    var monthValue = (STATE.reportMonth!=null) ? STATE.reportMonth : now.getMonth();
+    var yearValue = currentReportYearValue();
+    var monthValue = currentReportMonthValue();
     var period = resolveReportPeriod(yearValue, monthValue);
     var report = buildPeriodReport(STATE.claims, period.startDate, period.endDate);
     var periodLabel = period.label;
     var employees = STATE.profiles.filter(function(p){ return p.role==='user'; });
+    // Off by default (matches the on-screen checkbox's default) - the PDF
+    // stays a compact one-line-per-employee summary unless HR explicitly
+    // ticks "Include claim details" before exporting, in which case every
+    // employee's individual claims are itemised in the By Employee table.
+    var includeDetails = !!STATE.pdfIncludeClaimDetails;
 
     var empStats = employees.map(function(p){
-      var r = report.byEmployee[p.id]||{count:0,total:0};
+      var r = report.byEmployee[p.id]||{count:0,total:0,claims:[]};
       var pct = p.annual_allocation>0 ? (r.total/p.annual_allocation*100) : 0;
-      return {name:p.name, count:r.count, total:r.total, allocation:Number(p.annual_allocation)||0, pct:pct};
+      return {name:p.name, count:r.count, total:r.total, allocation:Number(p.annual_allocation)||0, pct:pct, claims:r.claims||[]};
     });
     var totalEntitlementPool = employees.reduce(function(s,p){ return s+(Number(p.annual_allocation)||0); }, 0);
     var overallUtilPct = totalEntitlementPool>0 ? (report.totalClaimed/totalEntitlementPool*100) : 0;
@@ -2617,6 +2824,42 @@
         theme:'grid', headStyles:{fillColor:[247,247,247], textColor:[60,60,60], fontStyle:'bold', lineColor:brandColor, lineWidth:0.3}, styles:{fontSize:9, lineColor:[225,225,225]}
       });
 
+      /* ---- Page(s): Claim Detail - only when "Include claim details" is
+         ticked. One itemised table per employee (skipping anyone with zero
+         claims, since they add nothing here and the summary above already
+         covers them), mirroring the on-screen expand view exactly. ---- */
+      if(includeDetails){
+        doc.addPage();
+        sectionHeading('Claim Detail - '+periodLabel, 18);
+        var withClaims = empSorted.filter(function(e){ return e.claims && e.claims.length; });
+        if(withClaims.length){
+          var dcy = 24;
+          withClaims.forEach(function(e){
+            if(dcy > pageHeight-40){ doc.addPage(); dcy = 20; }
+            doc.setFontSize(10); doc.setTextColor(40,40,40); doc.setFont(undefined,'bold');
+            doc.text(e.name, margin, dcy);
+            doc.setFont(undefined,'normal');
+            var claimRows = e.claims.map(function(cl, i){
+              return [String(i+1), cl.category, fmtDateDMY(cl.receiptDate), fmtMoney(cl.amount)];
+            });
+            claimRows.push(['', '', 'Total - '+e.claims.length+' claim'+(e.claims.length===1?'':'s'), fmtMoney(e.total)]);
+            doc.autoTable({
+              startY: dcy+3, margin:{left:margin, right:margin},
+              head:[['Claim #','Category','Receipt Date','Amount (SGD)']], body: claimRows,
+              theme:'grid', headStyles:{fillColor:[247,247,247], textColor:[60,60,60], fontStyle:'bold', lineColor:brandColor, lineWidth:0.3},
+              styles:{fontSize:8.5, lineColor:[225,225,225]},
+              didParseCell: function(data){
+                if(data.row.index===claimRows.length-1){ data.cell.styles.fontStyle='bold'; }
+              }
+            });
+            dcy = doc.lastAutoTable.finalY + 10;
+          });
+        } else {
+          doc.setFontSize(10); doc.setTextColor(120,120,120);
+          doc.text('No approved claims this period.', margin, 26);
+        }
+      }
+
       /* ---- Page: Rejected claims ---- */
       doc.addPage();
       sectionHeading('Rejected Claims - '+periodLabel, 18);
@@ -2649,6 +2892,8 @@
   function exportInvoicePDF(opts){
     if(typeof window.jspdf==='undefined' || !window.jspdf.jsPDF){ showToast('PDF export library did not load (needs an internet connection).', 'error'); return; }
     var year = opts.year;
+    var bounds = benefitYearBounds(year);
+    var nextBounds = benefitYearBounds(year+1);
     var inv = opts.inv;
     var invoiceNumber = opts.preview ? 'DRAFT - NOT YET ISSUED' : opts.invoiceNumber;
     var invoiceDate = opts.invoiceDate;
@@ -2705,15 +2950,15 @@
       else { doc.text('Invoice No: '+invoiceNumber, margin, iy+6); }
       var headerY = iy+12;
       if(opts.supersedesNumber){ doc.setTextColor(120,120,120); doc.text('Supersedes voided invoice: '+opts.supersedesNumber, margin, headerY); doc.setTextColor(40,40,40); headerY += 6; }
-      doc.text('Period Covered: 1 Jan '+year+' - 31 Dec '+year, margin, headerY);
+      doc.text('Period Covered: '+fmtDateDMY(bounds.startStr)+' - '+fmtDateDMY(bounds.endStr), margin, headerY);
 
       var cy = headerY+10;
       sectionHeading('Headcount Adjustment (True-Up for '+year+')', cy);
       doc.autoTable({
         startY: cy+4, margin:{left:margin, right:margin},
         body: [
-          ['Headcount as at 1 Jan '+year, String(inv.startHeadcount)],
-          ['Headcount as at 31 Dec '+year, String(inv.endHeadcount)],
+          ['Headcount as at '+fmtDateDMY(bounds.startStr), String(inv.startHeadcount)],
+          ['Headcount as at '+fmtDateDMY(bounds.endStr), String(inv.endHeadcount)],
           ['Net Change', String(inv.headcountDelta)],
           ['Adjustment Units (Net Change / 2)', String(inv.adjustmentUnits)],
           ['Rate per Headcount per Year', fmtMoney(inv.rate)],
@@ -2728,7 +2973,7 @@
       doc.autoTable({
         startY: cy+4, margin:{left:margin, right:margin},
         body: [
-          ['Headcount as at 1 Jan '+(year+1), String(inv.newYearHeadcount)],
+          ['Headcount as at '+fmtDateDMY(nextBounds.startStr), String(inv.newYearHeadcount)],
           ['Rate per Headcount per Year', fmtMoney(inv.rate)],
           ['Base Headcount Charge', baseChargeValueText],
           ['Total Headcount Charge (Base + Adjustment)', fmtMoney(inv.totalHeadcountCharge)]
@@ -2774,7 +3019,7 @@
       doc.text(noteLines, margin, cy);
 
       doc.addPage();
-      sectionHeading('Headcount as at 1 Jan '+(year+1)+' - by Employee', 18);
+      sectionHeading('Headcount as at '+fmtDateDMY(nextBounds.startStr)+' - by Employee', 18);
       doc.setFontSize(9); doc.setTextColor(100,100,100);
       doc.text('Supporting detail for the base headcount charge above. '+inv.newYearHeadcountList.length+' employee(s) counted.', margin, 24);
       if(inv.newYearHeadcountList.length){
@@ -2786,11 +3031,11 @@
         });
       } else {
         doc.setFontSize(10); doc.setTextColor(120,120,120);
-        doc.text('No employees on record as at 1 Jan '+(year+1)+'.', margin, 34);
+        doc.text('No employees on record as at '+fmtDateDMY(nextBounds.startStr)+'.', margin, 34);
       }
 
       doc.addPage();
-      sectionHeading('Headcount as at 1 Jan '+year+' - by Employee', 18);
+      sectionHeading('Headcount as at '+fmtDateDMY(bounds.startStr)+' - by Employee', 18);
       doc.setFontSize(9); doc.setTextColor(100,100,100);
       doc.text('Supporting detail for the headcount adjustment above. '+inv.startHeadcountList.length+' employee(s) counted.', margin, 24);
       if(inv.startHeadcountList.length){
@@ -2802,7 +3047,7 @@
         });
       } else {
         doc.setFontSize(10); doc.setTextColor(120,120,120);
-        doc.text('No employees on record as at 1 Jan '+year+'.', margin, 34);
+        doc.text('No employees on record as at '+fmtDateDMY(bounds.startStr)+'.', margin, 34);
       }
 
       doc.addPage();
@@ -3168,10 +3413,10 @@
     if(!category || !vendor || !amount || amount<=0 || !receiptDate || !file){ showToast('Please complete all fields.', 'error'); return Promise.resolve(); }
     if(file.size > 4*1024*1024){ showToast('File too large - please upload a file under 4MB.', 'error'); return Promise.resolve(); }
 
-    var currentYear = new Date().getFullYear();
-    var receiptYear = new Date(receiptDate+'T00:00:00').getFullYear();
-    if(receiptYear !== currentYear){
-      STATE.claimFormError = 'This receipt is dated '+fmtDate(receiptDate)+', which is not from '+currentYear+'. Only '+currentYear+' receipts can be claimed - your benefits reset every 1 January.';
+    var currentBY = currentBenefitYear();
+    var receiptBY = benefitYearForDate(receiptDate);
+    if(receiptBY !== currentBY){
+      STATE.claimFormError = 'This receipt is dated '+fmtDate(receiptDate)+', which falls outside the current benefit year. Only receipts from '+fmtDateDMY(yearStartStr())+' onward can be claimed this cycle - your benefits reset every '+benefitYearResetLabel()+'.';
       render();
       return Promise.resolve();
     }
@@ -3268,10 +3513,10 @@
     var familyMemberId = familySel ? (familySel.value || null) : claim.family_member_id;
     if(!category || !vendor || !amount || amount<=0 || !receiptDate){ showToast('Please complete all fields.', 'error'); return Promise.resolve(); }
 
-    var currentYear = new Date().getFullYear();
-    var receiptYear = new Date(receiptDate+'T00:00:00').getFullYear();
-    if(receiptYear !== currentYear){
-      STATE.claimFormError = 'This receipt is dated '+fmtDate(receiptDate)+', which is not from '+currentYear+'. Only '+currentYear+' receipts can be claimed - your benefits reset every 1 January.';
+    var currentBY = currentBenefitYear();
+    var receiptBY = benefitYearForDate(receiptDate);
+    if(receiptBY !== currentBY){
+      STATE.claimFormError = 'This receipt is dated '+fmtDate(receiptDate)+', which falls outside the current benefit year. Only receipts from '+fmtDateDMY(yearStartStr())+' onward can be claimed this cycle - your benefits reset every '+benefitYearResetLabel()+'.';
       render();
       return Promise.resolve();
     }
@@ -3647,6 +3892,18 @@
     }).then(function(){ render(); });
   }
 
+  function saveBenefitYearStartMonth(){
+    var input = document.getElementById('benefit-year-start-input');
+    var val = input ? parseInt(input.value,10) : NaN;
+    if(isNaN(val) || val<1 || val>12){ showToast('Please choose a month.', 'error'); return Promise.resolve(); }
+    STATE.editingBenefitYearStart = false;
+    return supabase.from('app_settings').upsert({key:'benefit_year_start_month', value:String(val)}, {onConflict:'key'}).then(function(res){
+      if(res.error){ showToast('Could not update the benefit year start month: '+res.error.message, 'error'); return; }
+      showToast('Benefit Year start month updated.', 'success');
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
   function addBenefit(form){
     var cat = form.category.value.trim();
     if(!cat) return Promise.resolve();
@@ -3701,6 +3958,7 @@
       // top-level tab, so Finance's own sub-tab needs setting too or it'd
       // land on Annual Invoice instead.
       case 'goto-newhire-invoicing': STATE.activeTab='finance'; STATE.financeSubTab='newhire'; render(); return Promise.resolve();
+      case 'goto-annual-invoice': STATE.activeTab='finance'; STATE.financeSubTab='annual'; render(); return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
       case 'buy-travel-insurance': window.open('https://sg-customer.qbe.com/travel/partner/01000960', '_blank', 'noopener,noreferrer'); return Promise.resolve();
@@ -3774,10 +4032,20 @@
       case 'remove-benefit': return removeBenefit(btn.dataset.cat);
       case 'export-report': exportReportExcel(); return Promise.resolve();
       case 'export-report-pdf': exportReportPDF(); return Promise.resolve();
+      case 'toggle-report-employee-detail':
+        var teId = btn.dataset.empId;
+        STATE.reportExpandedEmployees[teId] = !STATE.reportExpandedEmployees[teId];
+        render(); return Promise.resolve();
       case 'edit-invoice-rate': STATE.editingInvoiceRate=true; render(); return Promise.resolve();
       case 'save-invoice-rate': return saveInvoiceRate();
       case 'edit-client-name': STATE.editingClientName=true; render(); return Promise.resolve();
       case 'save-client-name': return saveClientName();
+      case 'edit-benefit-year-start': STATE.editingBenefitYearStart=true; render(); return Promise.resolve();
+      case 'save-benefit-year-start': return saveBenefitYearStartMonth();
+      case 'set-report-view-mode':
+        STATE.reportViewMode = (btn.dataset.mode==='calendar') ? 'calendar' : 'benefit';
+        STATE.reportMonth = null; STATE.reportYear = null;
+        render(); return Promise.resolve();
       case 'filter-history': STATE.historyFilter=btn.dataset.filter; render(); return Promise.resolve();
       case 'filter-staff': STATE.staffRoleFilter=btn.dataset.filter; render(); return Promise.resolve();
       case 'confirm-promotion': return confirmPromotion(id);
@@ -3992,6 +4260,8 @@
       scheduleSearchFilter(t, 'reportSearchQuery');
     } else if(t.id==='rejected-search-input'){
       scheduleSearchFilter(t, 'rejectedSearchQuery');
+    } else if(t.id==='pdf-include-details'){
+      STATE.pdfIncludeClaimDetails = t.checked;
     }
   }
 
@@ -4031,20 +4301,21 @@
       hint.textContent = 'Prorate off - the wallet will show the full '+fmtMoney(fullAlloc)+' right away.';
       return;
     }
-    var currentYear = new Date().getFullYear();
-    var effYear = Number(effectiveDate.slice(0,4));
-    var effMonth = Number(effectiveDate.slice(5,7));
-    if(effYear > currentYear){
-      hint.textContent = 'Effective date is in a future year - the full '+fmtMoney(fullAlloc)+' will apply once it arrives.';
+    var currentBY = currentBenefitYear();
+    var effBY = benefitYearForDate(effectiveDate);
+    if(effBY > currentBY){
+      hint.textContent = 'Effective date is in a future benefit year - the full '+fmtMoney(fullAlloc)+' will apply once it arrives.';
       return;
     }
-    if(effYear < currentYear){
-      hint.textContent = 'Effective date is in a past year - the full '+fmtMoney(fullAlloc)+' applies for '+currentYear+'.';
+    if(effBY < currentBY){
+      hint.textContent = 'Effective date is in a past benefit year - the full '+fmtMoney(fullAlloc)+' applies for '+benefitYearLabel(currentBY)+'.';
       return;
     }
-    var months = 12 - effMonth + 1;
+    var slot = monthSlotOf(effectiveDate);
+    var months = 12 - slot + 1;
     var prorated = fullAlloc * (months/12);
-    hint.textContent = 'Wallet will show '+fmtMoney(prorated)+' for the rest of '+currentYear+' ('+months+' of 12 months); the full '+fmtMoney(fullAlloc)+' applies from January '+(currentYear+1)+'.';
+    var nextBounds = benefitYearBounds(currentBY+1);
+    hint.textContent = 'Wallet will show '+fmtMoney(prorated)+' for the rest of this benefit year ('+months+' of 12 months); the full '+fmtMoney(fullAlloc)+' applies from '+REPORT_MONTH_NAMES[nextBounds.startMonth-1]+' '+nextBounds.startYear+'.';
   };
 
   var app = document.getElementById('app');
