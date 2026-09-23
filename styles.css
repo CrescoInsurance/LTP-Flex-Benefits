@@ -66,6 +66,11 @@
      renderAdminShell() on every admin tab regardless of which one is
      active - Money Holding/Utilisation is always a glance away rather
      than buried on the New Hire Invoicing sub-tab. */
+  /* Small read-only caption above the stat tiles naming the active
+     Benefit Year cycle - the actual Edit control lives on Finance >
+     Annual Invoice, this just keeps it visible everywhere else too. */
+  .money-banner-caption{font-size:11px;color:var(--text-muted);margin-bottom:6px;}
+  .money-banner-caption .link-btn{font-size:11px;}
   .money-banner{display:flex;flex-wrap:wrap;background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden;}
   .money-banner-item{display:flex;flex-direction:column;gap:3px;padding:10px 20px;border-right:1px solid var(--border);flex:1 1 auto;min-width:110px;}
   .money-banner-item:last-child{border-right:none;}
@@ -183,6 +188,16 @@
   .data-table tr:last-child td{border-bottom:none;}
   .actions-cell{white-space:nowrap;}
   .actions-cell .btn{margin-right:6px;}
+
+  /* ---------- Report: per-employee claim detail (expand/hide) ---------- */
+  .claim-detail-row td{background:var(--bg);padding:0 !important;border-bottom:1px solid var(--border);}
+  .claim-detail-wrap{padding:10px 14px 12px 32px;}
+  .claim-detail-table{width:100%;border-collapse:collapse;font-size:12px;}
+  .claim-detail-table th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.3px;color:var(--text-muted);padding:4px 8px;}
+  .claim-detail-table td{padding:4px 8px;}
+  .claim-detail-table tr.total-row td{border-top:1px solid var(--border);font-weight:700;padding-top:6px;}
+  .pdf-detail-check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-muted);}
+  .pdf-detail-check input{width:15px;height:15px;}
 
   /* ---------- Status pills ---------- */
   .status-pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:capitalize;}
