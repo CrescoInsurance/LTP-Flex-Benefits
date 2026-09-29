@@ -2905,14 +2905,14 @@
     doc.setDrawColor(210,210,210);
     doc.setLineWidth(0.2);
     doc.line(margin, y, pageWidth-margin, y);
-    y += 6;
+    y += 5;
     doc.setFontSize(9); doc.setTextColor(40,40,40);
     doc.text('Payment Details', margin, y);
-    y += 5.5;
+    y += 5;
     doc.setFontSize(8.5); doc.setTextColor(90,90,90);
-    doc.text('Payable to: '+CRESCO_BANK_DETAILS.accountName, margin, y); y += 4.5;
-    doc.text(CRESCO_BANK_DETAILS.bank+' - '+CRESCO_BANK_DETAILS.accountType, margin, y); y += 4.5;
-    doc.text('Account No: '+CRESCO_BANK_DETAILS.accountNumber, margin, y); y += 4.5;
+    doc.text('Payable to: '+CRESCO_BANK_DETAILS.accountName, margin, y); y += 4;
+    doc.text(CRESCO_BANK_DETAILS.bank+' - '+CRESCO_BANK_DETAILS.accountType, margin, y); y += 4;
+    doc.text('Account No: '+CRESCO_BANK_DETAILS.accountNumber, margin, y); y += 4;
     return y;
   }
 
@@ -2999,7 +2999,7 @@
         theme:'plain', styles:{fontSize:10, cellPadding:1.5},
         columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
       });
-      cy = doc.lastAutoTable.finalY + 12;
+      cy = doc.lastAutoTable.finalY + 10;
 
       sectionHeading('Headcount Charge for '+(year+1), cy);
       doc.autoTable({
@@ -3013,7 +3013,7 @@
         theme:'plain', styles:{fontSize:10, cellPadding:1.5},
         columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
       });
-      cy = doc.lastAutoTable.finalY + 12;
+      cy = doc.lastAutoTable.finalY + 10;
 
       sectionHeading('Unutilised Benefit (Credit Note)', cy);
       doc.autoTable({
@@ -3026,7 +3026,7 @@
         theme:'plain', styles:{fontSize:10, cellPadding:1.5},
         columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
       });
-      cy = doc.lastAutoTable.finalY + 12;
+      cy = doc.lastAutoTable.finalY + 10;
 
       sectionHeading('Invoice Summary', cy);
       var annualSummaryBody = [
@@ -3045,12 +3045,16 @@
           if(data.row.index===annualSummaryBody.length-1){ data.cell.styles.fontStyle='bold'; data.cell.styles.fillColor=[250,240,241]; }
         }
       });
-      cy = doc.lastAutoTable.finalY + 10;
+      cy = doc.lastAutoTable.finalY + 9;
       doc.setFontSize(8); doc.setTextColor(120,120,120);
       var noteLines = doc.splitTextToSize('Note: Any credit note balance may be applied to offset the following year\'s flex benefit charges.', pageWidth-margin*2);
       doc.text(noteLines, margin, cy);
-      cy += noteLines.length*4 + 8;
-      if(cy > pageHeight-35){ doc.addPage(); cy = 20; }
+      cy += noteLines.length*4 + 4;
+      // Payment Details always belongs on page 1 with the total, right next
+      // to what the client is actually paying - the addPage() fallback below
+      // is only a last-resort safety net for an unusually long note/waiver
+      // block, not something the common case should ever hit.
+      if(cy > pageHeight-30){ doc.addPage(); cy = 20; }
       drawPaymentDetailsBlock(doc, margin, pageWidth, cy);
 
       doc.addPage();
@@ -3235,7 +3239,7 @@
         theme:'grid', headStyles:{fillColor:[247,247,247], textColor:[60,60,60], fontStyle:'bold', lineColor:accent, lineWidth:0.3},
         styles:{fontSize:9, lineColor:[225,225,225]}
       });
-      cy = doc.lastAutoTable.finalY + 12;
+      cy = doc.lastAutoTable.finalY + 10;
 
       if(isInitial){
         sectionHeading('Headcount Establishment Charge', cy);
@@ -3250,7 +3254,7 @@
           theme:'plain', styles:{fontSize:10, cellPadding:1.5},
           columnStyles:{0:{fontStyle:'bold', cellWidth:110}}
         });
-        cy = doc.lastAutoTable.finalY + 12;
+        cy = doc.lastAutoTable.finalY + 10;
       }
 
       sectionHeading('Invoice Summary', cy);
@@ -3268,12 +3272,15 @@
           if(data.row.index===summaryBody.length-1){ data.cell.styles.fontStyle='bold'; data.cell.styles.fillColor=[250,240,241]; }
         }
       });
-      cy = doc.lastAutoTable.finalY + 10;
+      cy = doc.lastAutoTable.finalY + 9;
       doc.setFontSize(8); doc.setTextColor(120,120,120);
       var footNote = doc.splitTextToSize('This invoice bills entitlement dollars only - any headcount adjustment or base headcount charge for this client is billed separately on the Annual Invoice.'+(isPreview?' This is a draft preview - nothing has been saved or numbered yet.':''), pageWidth-margin*2);
       doc.text(footNote, margin, cy);
-      cy += footNote.length*4 + 8;
-      if(cy > pageHeight-35){ doc.addPage(); cy = 20; }
+      cy += footNote.length*4 + 4;
+      // Same as the Annual Invoice - Payment Details belongs on page 1 next
+      // to the total; addPage() here is only a safety net for an unusually
+      // long line-item list or waiver note, not the common case.
+      if(cy > pageHeight-30){ doc.addPage(); cy = 20; }
       drawPaymentDetailsBlock(doc, margin, pageWidth, cy);
 
       var fileTag = isPreview ? 'DRAFT' : String(invoiceNumber).replace(/[^A-Za-z0-9-]/g,'');
