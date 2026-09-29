@@ -2885,6 +2885,37 @@
     }
   }
 
+  // EDIT PER CLIENT ONLY IF CRESCO'S OWN BANKING CHANGES - this is Cresco's
+  // remittance account, shown on every invoice Cresco issues (Annual and
+  // Entitlement/New Hire alike), regardless of which client is being billed.
+  var CRESCO_BANK_DETAILS = {
+    accountName: 'Cresco Insurance Agency Pte Ltd',
+    bank: 'DBS Bank Ltd',
+    accountType: 'DBS Corporate Current Account',
+    accountNumber: '106-900974-0'
+  };
+
+  // Shared "Payment Details" block drawn near the bottom of every invoice
+  // PDF, right under the invoice summary/total - reused by both
+  // exportInvoicePDF (Annual) and exportEntitlementInvoicePDF (New Hire/
+  // Promotion/Initial Roster) so a banking change only needs editing once,
+  // above. Returns the y position after the block so callers can continue
+  // laying out content below it if needed.
+  function drawPaymentDetailsBlock(doc, margin, pageWidth, y){
+    doc.setDrawColor(210,210,210);
+    doc.setLineWidth(0.2);
+    doc.line(margin, y, pageWidth-margin, y);
+    y += 6;
+    doc.setFontSize(9); doc.setTextColor(40,40,40);
+    doc.text('Payment Details', margin, y);
+    y += 5.5;
+    doc.setFontSize(8.5); doc.setTextColor(90,90,90);
+    doc.text('Payable to: '+CRESCO_BANK_DETAILS.accountName, margin, y); y += 4.5;
+    doc.text(CRESCO_BANK_DETAILS.bank+' - '+CRESCO_BANK_DETAILS.accountType, margin, y); y += 4.5;
+    doc.text('Account No: '+CRESCO_BANK_DETAILS.accountNumber, margin, y); y += 4.5;
+    return y;
+  }
+
   // opts: {inv (already waiver-applied), year, invoiceNumber, invoiceDate, preview (bool)}
   // preview=true draws a "DRAFT - NOT YET ISSUED" watermark instead of a real
   // invoice number, for the Preview action; Issue and Invoice History
@@ -2912,6 +2943,7 @@
     try{
       var doc = new window.jspdf.jsPDF({unit:'mm', format:'a4'});
       var pageWidth = doc.internal.pageSize.getWidth();
+      var pageHeight = doc.internal.pageSize.getHeight();
       var margin = 15;
       var brandColor = CRESCO_COLOR_RGB;
       // Light-touch header (small logo, thin accent rule, tick-mark section
@@ -3017,6 +3049,9 @@
       doc.setFontSize(8); doc.setTextColor(120,120,120);
       var noteLines = doc.splitTextToSize('Note: Any credit note balance may be applied to offset the following year\'s flex benefit charges.', pageWidth-margin*2);
       doc.text(noteLines, margin, cy);
+      cy += noteLines.length*4 + 8;
+      if(cy > pageHeight-35){ doc.addPage(); cy = 20; }
+      drawPaymentDetailsBlock(doc, margin, pageWidth, cy);
 
       doc.addPage();
       sectionHeading('Headcount as at '+fmtDateDMY(nextBounds.startStr)+' - by Employee', 18);
@@ -3151,6 +3186,7 @@
 
       var doc = new window.jspdf.jsPDF({unit:'mm', format:'a4'});
       var pageWidth = doc.internal.pageSize.getWidth();
+      var pageHeight = doc.internal.pageSize.getHeight();
       var margin = 15;
       var accent = CRESCO_COLOR_RGB;
 
@@ -3236,6 +3272,9 @@
       doc.setFontSize(8); doc.setTextColor(120,120,120);
       var footNote = doc.splitTextToSize('This invoice bills entitlement dollars only - any headcount adjustment or base headcount charge for this client is billed separately on the Annual Invoice.'+(isPreview?' This is a draft preview - nothing has been saved or numbered yet.':''), pageWidth-margin*2);
       doc.text(footNote, margin, cy);
+      cy += footNote.length*4 + 8;
+      if(cy > pageHeight-35){ doc.addPage(); cy = 20; }
+      drawPaymentDetailsBlock(doc, margin, pageWidth, cy);
 
       var fileTag = isPreview ? 'DRAFT' : String(invoiceNumber).replace(/[^A-Za-z0-9-]/g,'');
       doc.save('entitlement-invoice-'+fileTag+'.pdf');
