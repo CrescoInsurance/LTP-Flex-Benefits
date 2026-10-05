@@ -810,6 +810,58 @@
     };
   }
 
+  // Annual Invoice outstanding check ------------------------------------
+  // The Annual Invoice is the year-end true-up for the benefit year that
+  // has JUST CLOSED (the same year the Annual Invoice screen defaults to:
+  // currentBenefitYear()-1, invoice dated just after that year's end date).
+  // So it becomes outstanding the moment a new benefit year begins - 1 Jan
+  // for a January-start client, or whichever month the client's "Benefit
+  // Year starts" setting (Finance > Client Setup) says - and stays flagged
+  // until an issued (non-voided) Annual Invoice exists for it. Because it
+  // reads benefitYearBounds(), it follows that setting automatically; no
+  // hard-coded date.
+  // Returns that benefit year's label (a number), or null when nothing is
+  // due. A brand-new client isn't flagged for a year before anyone was
+  // employed: at least one employee must have an Effective Date on or
+  // before that year's end and not have left before it started.
+  function annualInvoiceDueYear(){
+    if(!STATE.profile || STATE.profile.role!=='admin') return null;
+    var y = currentBenefitYear()-1;
+    var b = benefitYearBounds(y);
+    var hadStaff = (STATE.profiles||[]).some(function(p){
+      return p.role==='user' && p.effective_date && p.effective_date<=b.endStr &&
+        (!p.date_of_termination || p.date_of_termination>=b.startStr);
+    });
+    if(!hadStaff) return null;
+    var issued = (STATE.annualInvoices||[]).some(function(a){ return a.year===y && a.status==='issued'; });
+    return issued ? null : y;
+  }
+
+  // Everything that needs the admin's attention, in one place, so the All
+  // Submissions nav badge and the "Needs attention" strip can never disagree:
+  //  - pendingClaims:   claims awaiting approval
+  //  - unpaidInvoices:  issued entitlement invoices not yet marked paid
+  //  - newHireItems:    new hire / promotion items ready to invoice - only
+  //                     counted once utilisation is at/over 80% (same rule
+  //                     as the Finance badge, via entitlementCushionStatus)
+  //  - annualInvoice:   1 if the closed benefit year's Annual Invoice hasn't
+  //                     been issued yet (see annualInvoiceDueYear), else 0
+  function outstandingIssues(){
+    var pendingClaims = (STATE.claims||[]).filter(function(c){ return c.status==='pending'; }).length;
+    var unpaidInvoices = unpaidEntitlementInvoices().length;
+    var newHireItems = entitlementCushionStatus().reminderCount;
+    var annualYear = annualInvoiceDueYear();
+    var annualInvoice = annualYear!=null ? 1 : 0;
+    return {
+      pendingClaims: pendingClaims,
+      unpaidInvoices: unpaidInvoices,
+      newHireItems: newHireItems,
+      annualInvoice: annualInvoice,
+      annualYear: annualYear,
+      total: pendingClaims + unpaidInvoices + newHireItems + annualInvoice
+    };
+  }
+
   // Persistent strip shown on every admin screen (see renderAdminShell)
   // regardless of which tab is open, so Money Holding/Utilisation is
   // always a glance away rather than buried on the New Hire Invoicing
@@ -855,15 +907,23 @@
   // into its own tab just to notice it's there. Each chip jumps straight
   // to the screen that handles it.
   function renderActionItemsBanner(){
-    var pendingApprovals = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
-    var invoicingReminder = entitlementCushionStatus().reminderCount;
-    if(!pendingApprovals && !invoicingReminder) return '';
+    var issues = outstandingIssues();
+    var pendingApprovals = issues.pendingClaims;
+    var invoicingReminder = issues.newHireItems;
+    var unpaidInvoices = issues.unpaidInvoices;
+    if(!issues.total) return '';
     var chips = '';
     if(pendingApprovals){
       chips += '<button class="action-chip" data-action="nav" data-tab="approvals">'+pendingApprovals+' claim'+(pendingApprovals===1?'':'s')+' awaiting approval</button>';
     }
+    if(unpaidInvoices){
+      chips += '<button class="action-chip" data-action="goto-invoice-history">'+unpaidInvoices+' invoice'+(unpaidInvoices===1?'':'s')+' awaiting payment</button>';
+    }
     if(invoicingReminder){
       chips += '<button class="action-chip" data-action="goto-newhire-invoicing">'+invoicingReminder+' item'+(invoicingReminder===1?'':'s')+' ready to invoice (utilisation &ge; 80%)</button>';
+    }
+    if(issues.annualInvoice){
+      chips += '<button class="action-chip" data-action="goto-annual-invoice">Annual Invoice for '+escapeHtml(benefitYearLabel(issues.annualYear))+' not yet issued</button>';
     }
     return '<div class="action-banner"><span class="action-banner-label">Needs attention</span>'+chips+'</div>';
   }
@@ -1649,8 +1709,10 @@
       '<button class="btn btn-ghost btn-sm" data-action="logout">Log out</button></div>'+
     '</div>';
   }
-  function navTab(tab, label){
-    return '<button class="tab '+(STATE.activeTab===tab?'active':'')+'" data-action="nav" data-tab="'+tab+'">'+label+'</button>';
+  // `title` is optional hover text (used by the All Submissions badge to
+  // spell out what the combined count is made up of).
+  function navTab(tab, label, title){
+    return '<button class="tab '+(STATE.activeTab===tab?'active':'')+'" data-action="nav" data-tab="'+tab+'"'+(title?' title="'+escapeHtml(title)+'"':'')+'>'+label+'</button>';
   }
   function cardTitleWithClose(title){
     return '<div class="card-title card-title-row"><span>'+title+'</span>'+
@@ -1893,14 +1955,27 @@
     // invoicing (utilisation-triggered) and invoices already issued but not
     // yet marked paid - into one top-nav count; the New Hire Invoicing and
     // Invoice History sub-tab badges break the two back out individually.
-    var financeReminderCount = entitlementCushionStatus().reminderCount + unpaidEntitlementInvoices().length;
+    // Also counts the Annual Invoice once it's outstanding (a new benefit
+    // year has begun and the closed year's invoice hasn't been issued).
+    var issues = outstandingIssues();
+    var financeReminderCount = issues.newHireItems + issues.unpaidInvoices + issues.annualInvoice;
+    // All Submissions carries the combined "everything outstanding" count
+    // (pending claims + unpaid invoices + new hire items at 80%+ + annual
+    // invoice due); hovering spells out the breakdown. It deliberately
+    // overlaps the Pending Approvals and Finance badges - it's the one
+    // number that says "something needs you somewhere".
+    var allBreakdown = [];
+    if(issues.pendingClaims) allBreakdown.push(issues.pendingClaims+' claim'+(issues.pendingClaims===1?'':'s')+' awaiting approval');
+    if(issues.unpaidInvoices) allBreakdown.push(issues.unpaidInvoices+' invoice'+(issues.unpaidInvoices===1?'':'s')+' awaiting payment');
+    if(issues.newHireItems) allBreakdown.push(issues.newHireItems+' new hire/promotion item'+(issues.newHireItems===1?'':'s')+' ready to invoice');
+    if(issues.annualInvoice) allBreakdown.push('Annual Invoice for '+benefitYearLabel(issues.annualYear)+' not yet issued');
     var tab = STATE.activeTab || 'approvals';
     return '<div class="shell">'+renderTopbar()+
       renderMoneyHoldingBanner()+
       renderActionItemsBanner()+
       '<div class="tabs">'+
         navTab('approvals','Pending Approvals'+(pendingCount?' <span class="badge">'+pendingCount+'</span>':''))+
-        navTab('all','All Submissions')+
+        navTab('all','All Submissions'+(issues.total?' <span class="badge">'+issues.total+'</span>':''), allBreakdown.join(' \u00b7 '))+
         navTab('staff','Employee Management')+
         navTab('benefits','Benefit Categories')+
         navTab('access','User Access')+
@@ -1926,6 +2001,7 @@
     var sub = STATE.financeSubTab || 'annual';
     var reminderCount = entitlementCushionStatus().reminderCount;
     var unpaidCount = unpaidEntitlementInvoices().length;
+    var annualDue = annualInvoiceDueYear()!=null ? 1 : 0;
     var subTabBtn = function(key, label){
       return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
     };
@@ -1934,7 +2010,7 @@
       : ('<div class="field-hint" style="margin-bottom:14px;">Client Setup &middot; Benefit Year starts: '+REPORT_MONTH_NAMES[benefitYearStartMonth()-1]+' <button class="link-btn" data-action="edit-benefit-year-start">Edit</button></div>');
     return clientSetupStrip+
       '<div class="tabs" style="margin-bottom:16px;">'+
-        subTabBtn('annual','Annual Invoice')+
+        subTabBtn('annual','Annual Invoice'+(annualDue?' <span class="badge">'+annualDue+'</span>':''))+
         subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
         subTabBtn('history','Invoice History'+(unpaidCount?' <span class="badge">'+unpaidCount+'</span>':''))+
       '</div>'+
@@ -4005,6 +4081,8 @@
       // land on Annual Invoice instead.
       case 'goto-newhire-invoicing': STATE.activeTab='finance'; STATE.financeSubTab='newhire'; render(); return Promise.resolve();
       case 'goto-annual-invoice': STATE.activeTab='finance'; STATE.financeSubTab='annual'; render(); return Promise.resolve();
+      // Jumps to Invoice History from the action banner's "awaiting payment" chip.
+      case 'goto-invoice-history': STATE.activeTab='finance'; STATE.financeSubTab='history'; render(); return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
       case 'buy-travel-insurance': window.open('https://sg-customer.qbe.com/travel/partner/01000960', '_blank', 'noopener,noreferrer'); return Promise.resolve();
