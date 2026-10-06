@@ -79,7 +79,13 @@
     rejectedSortDirection: 'desc',
     reportMonth: null, reportYear: null,
     invoiceYear: null,
-    financeSubTab: null, // 'annual' | 'newhire' | 'history' - sub-tab within the Finance module
+    financeSubTab: null, // 'annual' | 'newhire' | 'history' | 'reimbursement' - sub-tab within the Finance module
+    reimbursementCycle: null,      // payout date (YYYY-MM-DD) of the batch being viewed on Finance > Reimbursement; null = auto-pick
+    reimbursementChecked: {},      // employeeId -> true for rows ticked "reimbursed" but not yet saved with Update
+    reimbursementConfirming: false, // true while the "are you sure - this emails people" bar is showing
+    reimbursementBusy: false,
+    reimbursementExpanded: {},     // "<employeeId>|todo|done" -> true when that claimant's claim list is open
+    adminSettingsDraft: null,      // {id, full, modules:{key:true}, digest, reminder} while an admin's access panel is open on User Access
     editingInvoiceRate: false,
     editingClientName: false,
     editingBenefitYearStart: false,
@@ -130,7 +136,7 @@
     if(!query) return true;
     var q = query.trim().toLowerCase();
     if(!q) return true;
-    var haystack = [c.category, c.vendor, c.status, c.currency].filter(Boolean).join(' ').toLowerCase();
+    var haystack = [c.category, c.vendor, c.status, claimDisplayStatus(c), c.currency].filter(Boolean).join(' ').toLowerCase();
     if(includeEmployee){ haystack += ' ' + employeeName(c.employee_id).toLowerCase(); }
     return haystack.indexOf(q) !== -1;
   }
@@ -199,7 +205,7 @@
   }
 
   function fetchRateFrankfurter(currency){
-    return fetch('https://api.frankfurter.app/latest?from='+encodeURIComponent(currency)+'&to=SGD')
+    return fetch('https://api.frankfurter.dev/v1/latest?from='+encodeURIComponent(currency)+'&to=SGD')
       .then(function(res){ if(!res.ok) throw new Error('Frankfurter returned '+res.status); return res.json(); })
       .then(function(data){
         var rate = data && data.rates && data.rates.SGD;
@@ -810,58 +816,6 @@
     };
   }
 
-  // Annual Invoice outstanding check ------------------------------------
-  // The Annual Invoice is the year-end true-up for the benefit year that
-  // has JUST CLOSED (the same year the Annual Invoice screen defaults to:
-  // currentBenefitYear()-1, invoice dated just after that year's end date).
-  // So it becomes outstanding the moment a new benefit year begins - 1 Jan
-  // for a January-start client, or whichever month the client's "Benefit
-  // Year starts" setting (Finance > Client Setup) says - and stays flagged
-  // until an issued (non-voided) Annual Invoice exists for it. Because it
-  // reads benefitYearBounds(), it follows that setting automatically; no
-  // hard-coded date.
-  // Returns that benefit year's label (a number), or null when nothing is
-  // due. A brand-new client isn't flagged for a year before anyone was
-  // employed: at least one employee must have an Effective Date on or
-  // before that year's end and not have left before it started.
-  function annualInvoiceDueYear(){
-    if(!STATE.profile || STATE.profile.role!=='admin') return null;
-    var y = currentBenefitYear()-1;
-    var b = benefitYearBounds(y);
-    var hadStaff = (STATE.profiles||[]).some(function(p){
-      return p.role==='user' && p.effective_date && p.effective_date<=b.endStr &&
-        (!p.date_of_termination || p.date_of_termination>=b.startStr);
-    });
-    if(!hadStaff) return null;
-    var issued = (STATE.annualInvoices||[]).some(function(a){ return a.year===y && a.status==='issued'; });
-    return issued ? null : y;
-  }
-
-  // Everything that needs the admin's attention, in one place, so the All
-  // Submissions nav badge and the "Needs attention" strip can never disagree:
-  //  - pendingClaims:   claims awaiting approval
-  //  - unpaidInvoices:  issued entitlement invoices not yet marked paid
-  //  - newHireItems:    new hire / promotion items ready to invoice - only
-  //                     counted once utilisation is at/over 80% (same rule
-  //                     as the Finance badge, via entitlementCushionStatus)
-  //  - annualInvoice:   1 if the closed benefit year's Annual Invoice hasn't
-  //                     been issued yet (see annualInvoiceDueYear), else 0
-  function outstandingIssues(){
-    var pendingClaims = (STATE.claims||[]).filter(function(c){ return c.status==='pending'; }).length;
-    var unpaidInvoices = unpaidEntitlementInvoices().length;
-    var newHireItems = entitlementCushionStatus().reminderCount;
-    var annualYear = annualInvoiceDueYear();
-    var annualInvoice = annualYear!=null ? 1 : 0;
-    return {
-      pendingClaims: pendingClaims,
-      unpaidInvoices: unpaidInvoices,
-      newHireItems: newHireItems,
-      annualInvoice: annualInvoice,
-      annualYear: annualYear,
-      total: pendingClaims + unpaidInvoices + newHireItems + annualInvoice
-    };
-  }
-
   // Persistent strip shown on every admin screen (see renderAdminShell)
   // regardless of which tab is open, so Money Holding/Utilisation is
   // always a glance away rather than buried on the New Hire Invoicing
@@ -907,23 +861,15 @@
   // into its own tab just to notice it's there. Each chip jumps straight
   // to the screen that handles it.
   function renderActionItemsBanner(){
-    var issues = outstandingIssues();
-    var pendingApprovals = issues.pendingClaims;
-    var invoicingReminder = issues.newHireItems;
-    var unpaidInvoices = issues.unpaidInvoices;
-    if(!issues.total) return '';
+    var pendingApprovals = adminHasModule('approvals') ? STATE.claims.filter(function(c){ return c.status==='pending'; }).length : 0;
+    var invoicingReminder = adminHasModule('finance') ? entitlementCushionStatus().reminderCount : 0;
+    if(!pendingApprovals && !invoicingReminder) return '';
     var chips = '';
     if(pendingApprovals){
       chips += '<button class="action-chip" data-action="nav" data-tab="approvals">'+pendingApprovals+' claim'+(pendingApprovals===1?'':'s')+' awaiting approval</button>';
     }
-    if(unpaidInvoices){
-      chips += '<button class="action-chip" data-action="goto-invoice-history">'+unpaidInvoices+' invoice'+(unpaidInvoices===1?'':'s')+' awaiting payment</button>';
-    }
     if(invoicingReminder){
       chips += '<button class="action-chip" data-action="goto-newhire-invoicing">'+invoicingReminder+' item'+(invoicingReminder===1?'':'s')+' ready to invoice (utilisation &ge; 80%)</button>';
-    }
-    if(issues.annualInvoice){
-      chips += '<button class="action-chip" data-action="goto-annual-invoice">Annual Invoice for '+escapeHtml(benefitYearLabel(issues.annualYear))+' not yet issued</button>';
     }
     return '<div class="action-banner"><span class="action-banner-label">Needs attention</span>'+chips+'</div>';
   }
@@ -1709,10 +1655,8 @@
       '<button class="btn btn-ghost btn-sm" data-action="logout">Log out</button></div>'+
     '</div>';
   }
-  // `title` is optional hover text (used by the All Submissions badge to
-  // spell out what the combined count is made up of).
-  function navTab(tab, label, title){
-    return '<button class="tab '+(STATE.activeTab===tab?'active':'')+'" data-action="nav" data-tab="'+tab+'"'+(title?' title="'+escapeHtml(title)+'"':'')+'>'+label+'</button>';
+  function navTab(tab, label){
+    return '<button class="tab '+(STATE.activeTab===tab?'active':'')+'" data-action="nav" data-tab="'+tab+'">'+label+'</button>';
   }
   function cardTitleWithClose(title){
     return '<div class="card-title card-title-row"><span>'+title+'</span>'+
@@ -1808,11 +1752,11 @@
   function renderUserHistory(){
     var claims = STATE.claims.slice();
     var filter = STATE.historyFilter||'all';
-    if(filter!=='all') claims = claims.filter(function(c){ return c.status===filter; });
+    if(filter!=='all') claims = claims.filter(function(c){ return claimDisplayStatus(c)===filter; });
     var searchQuery = STATE.historySearchQuery||'';
     claims = claims.filter(function(c){ return claimMatchesSearch(c, searchQuery, false); });
     claims.sort(function(a,b){ return b.submitted_at.localeCompare(a.submitted_at); });
-    var filters = ['all','pending','approved','rejected'];
+    var filters = ['all','pending','approved','reimbursed','rejected'];
     return '<div class="card">'+cardTitleWithClose('Transaction History')+
       '<div class="muted small" style="margin-bottom:12px;">Pending and rejected claims can be edited or deleted. Approved claims are locked.</div>'+
       '<input type="text" id="history-search-input" class="search-input" placeholder="Search by category, vendor, currency or status..." value="'+escapeHtml(searchQuery)+'" style="margin-bottom:12px;" />'+
@@ -1837,9 +1781,31 @@
   /* =========================================================
      SHARED: CLAIMS TABLE
   ========================================================== */
+  // A claim stays "approved" in the database for ever (balances, reports and
+  // invoices all read that), but once an admin has ticked it on Finance >
+  // Reimbursement it DISPLAYS as "Reimbursed".
+  function claimDisplayStatus(c){ return (c.status==='approved' && c.reimbursed_at) ? 'reimbursed' : c.status; }
+  function statusPillHtml(c){
+    var ds = claimDisplayStatus(c);
+    var sub = '';
+    if(ds==='rejected' && c.reject_reason) sub = '<div class="tiny muted">'+escapeHtml(c.reject_reason)+'</div>';
+    else if(ds==='approved') sub = '<div class="tiny muted">awaiting reimbursement</div>';
+    else if(ds==='reimbursed') sub = '<div class="tiny status-reimbursed-date">'+fmtDate(sgDateStrOf(c.reimbursed_at))+'</div>';
+    return '<span class="status-pill status-'+ds+'">'+ds+'</span>'+sub;
+  }
+  // The scheduled reimbursement date. A pending claim whose date has already
+  // gone by gets a fresh one the moment it is approved (database rule), so
+  // there is nothing meaningful to show yet.
+  function reimburseDateCell(c){
+    if(c.status==='rejected' || !c.payout_date) return '-';
+    if(c.status==='pending' && c.payout_date < sgTodayStr()) return '<span class="tiny muted">Set on approval</span>';
+    var t = fmtDate(c.payout_date);
+    return c.status==='pending' ? '<span class="muted">'+t+'</span>' : t;
+  }
+
   function renderClaimsTable(claims, showEmployee, adminActions, userActions){
     if(!claims.length) return '<div class="empty-state">No submissions found.</div>';
-    var colCount = 9 + (showEmployee?1:0) + (adminActions?1:0) + (userActions?1:0);
+    var colCount = 10 + (showEmployee?1:0) + (adminActions?1:0) + (userActions?1:0);
     var rows = claims.map(function(c){
       var row = '<tr>'+
         (showEmployee ? '<td>'+escapeHtml(employeeName(c.employee_id))+'</td>' : '')+
@@ -1850,9 +1816,8 @@
         '<td>'+fmtDate(c.receipt_date)+'</td>'+
         '<td>'+fmtDate((c.submitted_at||'').slice(0,10))+'</td>'+
         '<td>'+(c.status==='approved' ? fmtDate((c.decided_at||'').slice(0,10)) : '-')+'</td>'+
-        '<td><span class="status-pill status-'+c.status+'">'+c.status+'</span>'+
-          (c.status==='rejected' && c.reject_reason ? '<div class="tiny muted">'+escapeHtml(c.reject_reason)+'</div>' : '')+
-        '</td>'+
+        '<td>'+reimburseDateCell(c)+'</td>'+
+        '<td>'+statusPillHtml(c)+'</td>'+
         '<td>'+(c.receipt_path ? '<button class="link-btn" data-action="view-receipt" data-id="'+c.id+'">View</button>' : '-')+'</td>'+
         (adminActions ? (c.status==='pending' ? renderApprovalActions(c) : '<td> - </td>') : '')+
         (userActions ? renderUserActionsCell(c) : '')+
@@ -1867,7 +1832,7 @@
     }).join('');
     return '<div class="table-wrap"><table class="data-table"><thead><tr>'+
       (showEmployee?'<th>Employee</th>':'')+
-      '<th>Claiming For</th><th>Category</th><th>Vendor</th><th>Amount</th><th>Receipt Date</th><th>Submission Date</th><th>Approved</th><th>Status</th><th>Receipt</th>'+
+      '<th>Claiming For</th><th>Category</th><th>Vendor</th><th>Amount</th><th>Receipt Date</th><th>Submission Date</th><th>Approved</th><th>Reimburse Date</th><th>Status</th><th>Receipt</th>'+
       (adminActions?'<th>Actions</th>':'')+
       (userActions?'<th>Actions</th>':'')+
     '</tr></thead><tbody>'+rows+'</tbody></table></div>';
@@ -1943,47 +1908,80 @@
   }
 
   /* =========================================================
+     ADMIN MODULE ACCESS
+     profiles.admin_modules lists the modules an admin may use; NULL (or the
+     column not existing yet, before migration 018) means full access. This
+     only decides what the screens SHOW - the sensitive Reimbursement actions
+     and changes to roles / module access are also enforced in the database
+     (migration 018).
+  ========================================================== */
+  var ADMIN_MODULES = [
+    {key:'approvals',     label:'Pending Approvals'},
+    {key:'all',           label:'All Submissions'},
+    {key:'staff',         label:'Employee Management'},
+    {key:'benefits',      label:'Benefit Categories'},
+    {key:'access',        label:'User Access'},
+    {key:'finance',       label:'Finance - Invoicing'},
+    {key:'reimbursement', label:'Finance - Reimbursement'},
+    {key:'reports',       label:'Reports'}
+  ];
+  // The logged-in admin's own profile, preferring the freshly loaded list (so
+  // a change made on User Access takes effect straight away) over the copy
+  // read at login.
+  function ownAdminProfile(){
+    var id = STATE.session && STATE.session.user && STATE.session.user.id;
+    return (id && profileById(id)) || STATE.profile;
+  }
+  function adminHasModule(key){
+    var p = ownAdminProfile();
+    if(!p || p.role!=='admin') return false;
+    var m = p.admin_modules;
+    return !m || m.indexOf(key)!==-1;
+  }
+  function adminAccessSummary(p){
+    var m = p.admin_modules;
+    return (!m) ? 'Full access' : (m.length+' of '+ADMIN_MODULES.length+' modules');
+  }
+
+  /* =========================================================
      ADMIN MODULE
   ========================================================== */
   function renderAdminShell(){
-    var pendingCount = STATE.claims.filter(function(c){ return c.status==='pending'; }).length;
+    var can = adminHasModule;
+    var pendingCount = can('approvals') ? STATE.claims.filter(function(c){ return c.status==='pending'; }).length : 0;
     // The Finance tab badge only nags once utilisation has actually hit 80%
     // (entitlementCushionStatus().reminderCount) - not merely whenever
     // something is technically un-invoiced, which is normal and fine as
     // long as the float hasn't run down that far.
-    // Combines two distinct reasons Finance needs a look - items awaiting
-    // invoicing (utilisation-triggered) and invoices already issued but not
-    // yet marked paid - into one top-nav count; the New Hire Invoicing and
-    // Invoice History sub-tab badges break the two back out individually.
-    // Also counts the Annual Invoice once it's outstanding (a new benefit
-    // year has begun and the closed year's invoice hasn't been issued).
-    var issues = outstandingIssues();
-    var financeReminderCount = issues.newHireItems + issues.unpaidInvoices + issues.annualInvoice;
-    // All Submissions carries the combined "everything outstanding" count
-    // (pending claims + unpaid invoices + new hire items at 80%+ + annual
-    // invoice due); hovering spells out the breakdown. It deliberately
-    // overlaps the Pending Approvals and Finance badges - it's the one
-    // number that says "something needs you somewhere".
-    var allBreakdown = [];
-    if(issues.pendingClaims) allBreakdown.push(issues.pendingClaims+' claim'+(issues.pendingClaims===1?'':'s')+' awaiting approval');
-    if(issues.unpaidInvoices) allBreakdown.push(issues.unpaidInvoices+' invoice'+(issues.unpaidInvoices===1?'':'s')+' awaiting payment');
-    if(issues.newHireItems) allBreakdown.push(issues.newHireItems+' new hire/promotion item'+(issues.newHireItems===1?'':'s')+' ready to invoice');
-    if(issues.annualInvoice) allBreakdown.push('Annual Invoice for '+benefitYearLabel(issues.annualYear)+' not yet issued');
-    var tab = STATE.activeTab || 'approvals';
+    // Combines the distinct reasons Finance needs a look - items awaiting
+    // invoicing (utilisation-triggered), invoices already issued but not yet
+    // marked paid, and approved claims whose reimbursement date has arrived
+    // - into one top-nav count; the sub-tab badges break them back out.
+    // Each part only counts for an admin who can actually open it.
+    var financeReminderCount =
+      (can('finance') ? (entitlementCushionStatus().reminderCount + unpaidEntitlementInvoices().length) : 0) +
+      (can('reimbursement') ? reimbursementDueClaims().length : 0);
+    var navDefs = [
+      {key:'approvals', show:can('approvals'),  label:'Pending Approvals'+(pendingCount?' <span class="badge">'+pendingCount+'</span>':'')},
+      {key:'all',       show:can('all'),        label:'All Submissions'},
+      {key:'staff',     show:can('staff'),      label:'Employee Management'},
+      {key:'benefits',  show:can('benefits'),   label:'Benefit Categories'},
+      {key:'access',    show:can('access'),     label:'User Access'},
+      {key:'finance',   show:(can('finance')||can('reimbursement')), label:'Finance'+(financeReminderCount?' <span class="badge">'+financeReminderCount+'</span>':'')},
+      {key:'reports',   show:can('reports'),    label:'Reports'}
+    ].filter(function(d){ return d.show; });
+    var allowedKeys = navDefs.map(function(d){ return d.key; });
+    // If the open tab isn't (or is no longer) allowed - e.g. access was just
+    // changed - fall back to the first one that is.
+    if(allowedKeys.indexOf(STATE.activeTab)===-1){ STATE.activeTab = allowedKeys[0] || null; }
+    var tab = STATE.activeTab;
     return '<div class="shell">'+renderTopbar()+
-      renderMoneyHoldingBanner()+
+      (can('finance') ? renderMoneyHoldingBanner() : '')+
       renderActionItemsBanner()+
-      '<div class="tabs">'+
-        navTab('approvals','Pending Approvals'+(pendingCount?' <span class="badge">'+pendingCount+'</span>':''))+
-        navTab('all','All Submissions'+(issues.total?' <span class="badge">'+issues.total+'</span>':''), allBreakdown.join(' \u00b7 '))+
-        navTab('staff','Employee Management')+
-        navTab('benefits','Benefit Categories')+
-        navTab('access','User Access')+
-        navTab('finance','Finance'+(financeReminderCount?' <span class="badge">'+financeReminderCount+'</span>':''))+
-        navTab('reports','Reports')+
-      '</div>'+
+      '<div class="tabs">'+navDefs.map(function(d){ return navTab(d.key, d.label); }).join('')+'</div>'+
       '<div class="content">'+
-        (tab==='all' ? renderAdminAllSubmissions() :
+        (!tab ? '<div class="card"><div class="empty-state">Your account is an administrator but has no modules switched on. Ask an administrator with User Access to enable the ones you need.</div></div>' :
+         tab==='all' ? renderAdminAllSubmissions() :
          tab==='staff' ? renderAdminStaff() :
          tab==='benefits' ? renderAdminBenefits() :
          tab==='access' ? renderAdminAccess() :
@@ -1998,24 +1996,29 @@
   // top-level "Finance" tab with their own sub-tab row, rather than
   // crowding the main nav with three separate top-level tabs.
   function renderAdminFinanceModule(){
-    var sub = STATE.financeSubTab || 'annual';
-    var reminderCount = entitlementCushionStatus().reminderCount;
-    var unpaidCount = unpaidEntitlementInvoices().length;
-    var annualDue = annualInvoiceDueYear()!=null ? 1 : 0;
+    var canInvoice = adminHasModule('finance'), canReimburse = adminHasModule('reimbursement');
+    var allowedSubs = (canInvoice ? ['annual','newhire','history'] : []).concat(canReimburse ? ['reimbursement'] : []);
+    var sub = (STATE.financeSubTab && allowedSubs.indexOf(STATE.financeSubTab)!==-1) ? STATE.financeSubTab : allowedSubs[0];
+    if(!sub){ return '<div class="card"><div class="empty-state">No Finance modules are switched on for your account.</div></div>'; }
+    var reminderCount = canInvoice ? entitlementCushionStatus().reminderCount : 0;
+    var unpaidCount = canInvoice ? unpaidEntitlementInvoices().length : 0;
+    var reimbDueCount = canReimburse ? reimbursementDueClaims().length : 0;
     var subTabBtn = function(key, label){
       return '<button class="tab '+(sub===key?'active':'')+'" data-action="finance-subtab" data-subtab="'+key+'">'+label+'</button>';
     };
     var clientSetupStrip = STATE.editingBenefitYearStart
       ? ('<div class="field-hint" style="margin-bottom:14px;">Client Setup &middot; Benefit Year starts: <select id="benefit-year-start-input">'+REPORT_MONTH_NAMES.map(function(mn,i){ return '<option value="'+(i+1)+'" '+((i+1)===benefitYearStartMonth()?'selected':'')+'>'+mn+'</option>'; }).join('')+'</select> <button class="btn btn-sm btn-primary" data-action="save-benefit-year-start">Save</button></div>')
       : ('<div class="field-hint" style="margin-bottom:14px;">Client Setup &middot; Benefit Year starts: '+REPORT_MONTH_NAMES[benefitYearStartMonth()-1]+' <button class="link-btn" data-action="edit-benefit-year-start">Edit</button></div>');
-    return clientSetupStrip+
+    return (canInvoice ? clientSetupStrip : '')+
       '<div class="tabs" style="margin-bottom:16px;">'+
-        subTabBtn('annual','Annual Invoice'+(annualDue?' <span class="badge">'+annualDue+'</span>':''))+
-        subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
-        subTabBtn('history','Invoice History'+(unpaidCount?' <span class="badge">'+unpaidCount+'</span>':''))+
+        (canInvoice ? (subTabBtn('annual','Annual Invoice')+
+          subTabBtn('newhire','New Hire Invoicing'+(reminderCount?' <span class="badge">'+reminderCount+'</span>':''))+
+          subTabBtn('history','Invoice History'+(unpaidCount?' <span class="badge">'+unpaidCount+'</span>':''))) : '')+
+        (canReimburse ? subTabBtn('reimbursement','Reimbursement'+(reimbDueCount?' <span class="badge">'+reimbDueCount+'</span>':'')) : '')+
       '</div>'+
       (sub==='newhire' ? renderAdminNewHireInvoicing() :
        sub==='history' ? renderAdminInvoiceHistory() :
+       sub==='reimbursement' ? renderAdminReimbursement() :
        renderAdminFinance());
   }
 
@@ -2236,6 +2239,58 @@
       '<div class="field-hint">Removing a category only affects future claims - historical submissions keep their original category.</div></div>';
   }
 
+  function adminAccessCell(p){
+    if(p.role!=='admin') return '<td><span class="tiny muted">&mdash;</span></td>';
+    var alerts = [];
+    if(p.notify_pending_digest) alerts.push('daily digest');
+    if(p.notify_payout_reminder) alerts.push('reimbursement reminder');
+    return '<td><div class="tiny"><strong>'+escapeHtml(adminAccessSummary(p))+'</strong></div>'+
+      '<div class="tiny muted">'+(alerts.length ? ('Emails: '+alerts.join(', ')) : 'No admin emails')+'</div>'+
+      '<button class="link-btn tiny" data-action="edit-admin-settings" data-id="'+p.id+'">Manage</button></td>';
+  }
+  function renderAdminSettingsPanel(p){
+    var d = STATE.adminSettingsDraft;
+    var isSelf = STATE.session && STATE.session.user && p.id===STATE.session.user.id;
+    var moduleBoxes = ADMIN_MODULES.map(function(m){
+      var locked = d.full || (isSelf && m.key==='access');
+      return '<label class="admin-check"><input type="checkbox" data-action="admin-module-toggle" data-module="'+m.key+'" '+((d.full||d.modules[m.key])?'checked':'')+' '+(locked?'disabled':'')+'/> '+escapeHtml(m.label)+'</label>';
+    }).join('');
+    return '<div class="admin-settings-panel">'+
+      '<div style="font-weight:700; margin-bottom:8px;">Access &amp; email alerts for '+escapeHtml(p.name)+'</div>'+
+      '<label class="admin-check"><input type="checkbox" data-action="admin-full-access" '+(d.full?'checked':'')+'/> <strong>Full access</strong> - every module, including any added in future</label>'+
+      '<div class="admin-module-grid">'+moduleBoxes+'</div>'+
+      (isSelf ? '<div class="tiny muted" style="margin-bottom:8px;">You can\'t remove your own User Access.</div>' : '')+
+      '<div class="tiny muted" style="margin-bottom:4px;">Email alerts</div>'+
+      '<label class="admin-check"><input type="checkbox" data-action="admin-notify-digest" '+(d.digest?'checked':'')+'/> Daily pending-claims digest (9am) <span class="tiny muted">- needs Pending Approvals</span></label>'+
+      '<label class="admin-check"><input type="checkbox" data-action="admin-notify-reminder" '+(d.reminder?'checked':'')+'/> Reimbursement-day reminder (8am on the 7th, or the next working day) <span class="tiny muted">- needs Reimbursement</span></label>'+
+      '<div style="margin-top:12px; display:flex; gap:10px;">'+
+        '<button class="btn btn-sm btn-primary" data-action="save-admin-settings">Save</button>'+
+        '<button class="btn btn-sm" data-action="cancel-admin-settings">Cancel</button>'+
+      '</div>'+
+    '</div>';
+  }
+  function openAdminSettings(id){
+    var p = profileById(id); if(!p) return;
+    var mods = {};
+    ADMIN_MODULES.forEach(function(m){ mods[m.key] = !p.admin_modules || p.admin_modules.indexOf(m.key)!==-1; });
+    STATE.adminSettingsDraft = {id:id, full:!p.admin_modules, modules:mods, digest:!!p.notify_pending_digest, reminder:!!p.notify_payout_reminder};
+    render();
+  }
+  function saveAdminSettings(){
+    var d = STATE.adminSettingsDraft; if(!d) return Promise.resolve();
+    var isSelf = STATE.session && STATE.session.user && d.id===STATE.session.user.id;
+    var list = d.full ? null : ADMIN_MODULES.filter(function(m){ return d.modules[m.key]; }).map(function(m){ return m.key; });
+    if(list && !list.length){ showToast('Tick at least one module, or choose Full access.', 'error'); return Promise.resolve(); }
+    if(list && isSelf && list.indexOf('access')===-1){ showToast('You can\'t remove your own User Access.', 'error'); return Promise.resolve(); }
+    var payload = {admin_modules:list, notify_pending_digest:!!d.digest, notify_payout_reminder:!!d.reminder};
+    return supabase.from('profiles').update(payload).eq('id', d.id).then(function(res){
+      if(res.error){ showToast('Could not save: '+res.error.message, 'error'); return; }
+      STATE.adminSettingsDraft = null;
+      showToast('Admin access updated.', 'success');
+      return loadAppData();
+    }).then(function(){ render(); });
+  }
+
   function renderAdminAccess(){
     var today = todayStr();
     var rows = STATE.profiles.map(function(p){
@@ -2250,15 +2305,18 @@
       var statusClass = (isTerminated || !p.active) ? 'status-rejected' : 'status-approved';
       return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.email)+'</td>'+
         '<td><select data-action="change-role" data-id="'+p.id+'"><option value="user" '+(p.role==='user'?'selected':'')+'>User</option><option value="admin" '+(p.role==='admin'?'selected':'')+'>Admin</option></select></td>'+
+        adminAccessCell(p)+
         '<td>'+fmtDate((p.created_at||'').slice(0,10))+'</td>'+
         '<td>'+(!p.active && p.deactivated_at ? fmtDate((p.deactivated_at||'').slice(0,10)) : '-')+'</td>'+
         '<td><span class="status-pill '+statusClass+'">'+statusLabel+'</span></td>'+
         '<td><button class="btn btn-sm btn-ghost" data-action="toggle-active" data-id="'+p.id+'">'+(p.active?'Deactivate':'Activate')+'</button></td>'+
-      '</tr>';
+      '</tr>'+
+      ((STATE.adminSettingsDraft && STATE.adminSettingsDraft.id===p.id) ? '<tr><td colspan="8">'+renderAdminSettingsPanel(p)+'</td></tr>' : '');
     }).join('');
     return '<div class="card"><div class="card-title">User Access Rights</div><div class="table-wrap"><table class="data-table">'+
-      '<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Date Added</th><th>Date of Deactivation</th><th>Status</th><th>Actions</th></tr></thead>'+
+      '<thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Admin Access</th><th>Date Added</th><th>Date of Deactivation</th><th>Status</th><th>Actions</th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table></div>'+
+      '<div class="field-hint">For administrators, <strong>Manage</strong> chooses which modules they can use and which email alerts they receive. Newly promoted administrators start without User Access and Reimbursement until you tick them.</div>'+
       '<div class="field-hint">Password resets are self-service - employees use "Forgot password?" on the login screen.</div>'+
       '<div class="field-hint">Status shows <strong>Terminated</strong> once an employee\'s Date of Termination (set on Employee Directory) has passed, even if nobody has separately clicked Deactivate for them here - their login is already blocked either way, so there\'s no need to do both.</div>'+
     '</div>';
@@ -2518,6 +2576,239 @@
       '<div class="tiny muted" style="margin-top:6px;">Preview is a live calculation only - nothing is saved or numbered until you Issue.</div>')
       : '')+
     '</div>';
+  }
+
+  /* ---------------------------------------------------------------------
+     REIMBURSEMENT (Finance > Reimbursement tab)
+     -----------------------------------------------------------------------
+     Claims are paid in monthly batches. The database stamps every claim with
+     a payout_date when it is submitted (claim_reimbursement_date() in
+     migration 017: submitted on/before the 28th -> the 7th of next month,
+     otherwise the 7th of the month after; a weekend or Singapore public
+     holiday moves it to the next working day). This tab just groups approved
+     claims by that stamped date, so the rule lives in ONE place (SQL).
+     REIMBURSEMENT_CUTOFF_DAY below only labels each batch's submission
+     window ("29 Sep - 28 Oct"); keep it equal to the 28 in that function.
+  --------------------------------------------------------------------- */
+  var REIMBURSEMENT_CUTOFF_DAY = 28;
+  var WEEKDAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  function sgDateStrOf(iso){
+    // YYYY-MM-DD of an instant as seen in Singapore (en-CA formats as ISO date)
+    return new Date(iso).toLocaleDateString('en-CA', {timeZone:'Asia/Singapore'});
+  }
+  function sgTodayStr(){ return sgDateStrOf(new Date().toISOString()); }
+  function fmtDateWithWeekday(dateStr){
+    var p = dateStr.split('-').map(Number);
+    return WEEKDAY_SHORT[new Date(Date.UTC(p[0], p[1]-1, p[2])).getUTCDay()]+' '+fmtDateDMY(dateStr);
+  }
+  // "29 Sep - 28 Oct" for a batch paid in the month of payoutStr: claims
+  // submitted after the cut-off two months back, up to the cut-off last month.
+  function reimbursementWindowLabel(payoutStr){
+    var p = payoutStr.split('-').map(Number);
+    var endD = new Date(Date.UTC(p[0], p[1]-1-1, REIMBURSEMENT_CUTOFF_DAY));
+    var startD = new Date(Date.UTC(p[0], p[1]-1-2, REIMBURSEMENT_CUTOFF_DAY));
+    var endStr = endD.toISOString().slice(0,10);
+    var startStr = addDaysToDateStr(startD.toISOString().slice(0,10), 1);
+    return fmtDateDMY(startStr)+' - '+fmtDateDMY(endStr);
+  }
+  function approvedClaimsByPayoutDate(){
+    var byDate = {};
+    (STATE.claims||[]).forEach(function(c){
+      if(c.status!=='approved' || !c.payout_date) return;
+      (byDate[c.payout_date] = byDate[c.payout_date] || []).push(c);
+    });
+    return byDate;
+  }
+  // Approved claims whose payout date has arrived (or passed) and that haven't
+  // been marked reimbursed - the Reimbursement sub-tab badge.
+  function reimbursementDueClaims(){
+    var today = sgTodayStr();
+    return (STATE.claims||[]).filter(function(c){
+      return c.status==='approved' && c.payout_date && !c.reimbursed_at && c.payout_date <= today;
+    });
+  }
+  function reimbursementSelectedCycle(byDate){
+    var dates = Object.keys(byDate).sort();
+    if(STATE.reimbursementCycle && byDate[STATE.reimbursementCycle]) return STATE.reimbursementCycle;
+    for(var i=0;i<dates.length;i++){
+      if(byDate[dates[i]].some(function(c){ return !c.reimbursed_at; })) return dates[i];
+    }
+    return dates.length ? dates[dates.length-1] : null;
+  }
+  // One row per claimant still to be paid in this batch, then one row per
+  // claimant already paid (a claim approved late, after the batch was paid,
+  // becomes its own "to pay" row next to that person's "reimbursed" row).
+  function reimbursementRowsFor(claims){
+    function group(list){
+      var map = {}, order = [];
+      list.forEach(function(c){
+        if(!map[c.employee_id]){ map[c.employee_id] = {empId:c.employee_id, claims:[], total:0}; order.push(c.employee_id); }
+        map[c.employee_id].claims.push(c);
+        map[c.employee_id].total += sgdAmountOf(c);
+      });
+      return order.map(function(id){ return map[id]; }).sort(function(a,b){
+        var pa = profileById(a.empId), pb = profileById(b.empId);
+        return ((pa&&pa.name)||'').localeCompare((pb&&pb.name)||'');
+      });
+    }
+    var todo = group(claims.filter(function(c){ return !c.reimbursed_at; }));
+    var done = group(claims.filter(function(c){ return !!c.reimbursed_at; }));
+    done.forEach(function(r){
+      r.reimbursedOn = r.claims.map(function(c){ return c.reimbursed_at; }).sort().slice(-1)[0];
+    });
+    return {todo:todo, done:done};
+  }
+  function reimbursementSelection(todoRows){
+    var picked = todoRows.filter(function(r){ return STATE.reimbursementChecked[r.empId]; });
+    return {
+      rows: picked,
+      claimIds: picked.reduce(function(a,r){ return a.concat(r.claims.map(function(c){ return c.id; })); }, []),
+      total: picked.reduce(function(s,r){ return s+r.total; }, 0)
+    };
+  }
+
+  function renderAdminReimbursement(){
+    var intro = '<div class="field-hint" style="margin-bottom:14px;">Approved claims grouped by reimbursement date. Claims submitted on or before the '+REIMBURSEMENT_CUTOFF_DAY+'th are paid on the 7th of the next month (the next working day if the 7th is a weekend or public holiday); claims submitted after the '+REIMBURSEMENT_CUTOFF_DAY+'th are paid a month later. Tick the claimants you have paid and press Update - each person is emailed to confirm their reimbursement.</div>';
+    var anyClaims = (STATE.claims||[]).length>0;
+    if(anyClaims && !(STATE.claims||[]).some(function(c){ return Object.prototype.hasOwnProperty.call(c,'payout_date'); })){
+      return '<div class="card"><div class="card-title">Reimbursement</div><div class="empty-state">This tab needs database migration 017 (017_reimbursement_cycle.sql) to be run in the Supabase SQL Editor first.</div></div>';
+    }
+    var byDate = approvedClaimsByPayoutDate();
+    var dates = Object.keys(byDate).sort();
+    if(!dates.length){
+      return '<div class="card"><div class="card-title">Reimbursement</div>'+intro+'<div class="empty-state">No approved claims yet.</div></div>';
+    }
+    var cycle = reimbursementSelectedCycle(byDate);
+    var cycleClaims = byDate[cycle];
+    var rowsInfo = reimbursementRowsFor(cycleClaims);
+    var sel = reimbursementSelection(rowsInfo.todo);
+    var pendingInBatch = (STATE.claims||[]).filter(function(c){ return c.status==='pending' && c.payout_date===cycle; }).length;
+    var today = sgTodayStr();
+
+    var cycleOptions = dates.map(function(d){
+      var outstanding = byDate[d].filter(function(c){ return !c.reimbursed_at; }).length;
+      var tag = outstanding ? (outstanding+' to pay') : 'all paid';
+      return '<option value="'+d+'" '+(d===cycle?'selected':'')+'>'+escapeHtml(fmtDateWithWeekday(d)+' - claims submitted '+reimbursementWindowLabel(d)+' ('+tag+')')+'</option>';
+    }).join('');
+
+    function mobileCell(empId){
+      var pr = profileById(empId);
+      return (pr && pr.paynow_mobile) ? escapeHtml(pr.paynow_mobile) : '<span class="muted">&mdash;</span>';
+    }
+    function nameCell(empId){
+      var pr = profileById(empId);
+      return escapeHtml(pr ? pr.name : 'Unknown employee');
+    }
+    function shortDM(str){ var q = str.split('-').map(Number); return q[2]+' '+REPORT_MONTH_NAMES[q[1]-1].slice(0,3); }
+    function submittedRange(list){
+      var ds = list.map(function(c){ return sgDateStrOf(c.submitted_at); }).sort();
+      return ds[0]===ds[ds.length-1] ? shortDM(ds[0]) : (shortDM(ds[0])+' - '+shortDM(ds[ds.length-1]));
+    }
+    // One row per claimant (todo = still to pay, done = already reimbursed),
+    // each with an open/close arrow that lists that person's claims with
+    // their submission and approval dates.
+    function claimantRows(list, state){
+      return list.map(function(r){
+        var key = r.empId+'|'+state;
+        var open = !!STATE.reimbursementExpanded[key];
+        var sorted = r.claims.slice().sort(function(x,y){ return x.submitted_at.localeCompare(y.submitted_at); });
+        var lastCell = state==='todo'
+          ? '<label style="cursor:pointer;"><input type="checkbox" data-action="toggle-reimb-emp" data-emp-id="'+r.empId+'" '+(STATE.reimbursementChecked[r.empId]?'checked':'')+'/> Reimbursed</label>'
+          : '<label class="tiny muted"><input type="checkbox" checked disabled/> Reimbursed '+fmtDateDMY(sgDateStrOf(r.reimbursedOn))+'</label>';
+        var main = '<tr class="'+(state==='done'?'reimb-done-row':'')+'">'+
+          '<td><button class="link-btn" style="text-decoration:none;" data-action="toggle-reimb-detail" data-key="'+key+'" title="Show this person\'s claims">'+(open?'&#9660;':'&#9654;')+'</button> '+nameCell(r.empId)+'</td>'+
+          '<td>'+mobileCell(r.empId)+'</td>'+
+          '<td>'+r.claims.length+'</td>'+
+          '<td>'+submittedRange(sorted)+'</td>'+
+          '<td>'+fmtMoney(r.total)+'</td>'+
+          '<td>'+lastCell+'</td>'+
+        '</tr>';
+        var detail = '';
+        if(open){
+          detail = '<tr class="claim-detail-row"><td colspan="6"><div class="claim-detail-wrap"><table class="claim-detail-table">'+
+            '<thead><tr><th>Category</th><th>Vendor</th><th>Submitted</th><th>Approved</th><th>Amount</th></tr></thead><tbody>'+
+            sorted.map(function(c){
+              return '<tr><td>'+escapeHtml(c.category)+'</td><td>'+escapeHtml(c.vendor||'-')+'</td>'+
+                '<td>'+fmtDateDMY(sgDateStrOf(c.submitted_at))+'</td>'+
+                '<td>'+(c.decided_at ? fmtDateDMY(sgDateStrOf(c.decided_at)) : '-')+'</td>'+
+                '<td>'+fmtMoney(sgdAmountOf(c))+((c.currency && c.currency!=='SGD') ? ' <span class="tiny muted">('+escapeHtml(fmtCurrencyAmount(c.currency, c.amount))+')</span>' : '')+'</td></tr>';
+            }).join('')+
+            '<tr class="total-row"><td colspan="4">Total - '+r.claims.length+' claim'+(r.claims.length===1?'':'s')+'</td><td>'+fmtMoney(r.total)+'</td></tr>'+
+          '</tbody></table></div></td></tr>';
+        }
+        return main+detail;
+      }).join('');
+    }
+    var todoHtml = claimantRows(rowsInfo.todo, 'todo');
+    var doneHtml = claimantRows(rowsInfo.done, 'done');
+
+    var todoTotal = rowsInfo.todo.reduce(function(s,r){ return s+r.total; }, 0);
+    var todoClaims = rowsInfo.todo.reduce(function(s,r){ return s+r.claims.length; }, 0);
+    var allTicked = rowsInfo.todo.length>0 && sel.rows.length===rowsInfo.todo.length;
+
+    var dueNote = '';
+    if(rowsInfo.todo.length){
+      dueNote = cycle > today
+        ? '<span class="tiny muted">Reimbursement date is '+fmtDateWithWeekday(cycle)+' - not due yet.</span>'
+        : '<span class="tiny" style="color:var(--warning);">Reimbursement date '+fmtDateWithWeekday(cycle)+' has arrived - '+rowsInfo.todo.length+' claimant'+(rowsInfo.todo.length===1?'':'s')+' still to pay.</span>';
+    }
+
+    var actionBar = '';
+    if(rowsInfo.todo.length){
+      if(STATE.reimbursementConfirming && sel.rows.length){
+        actionBar = '<div class="field-hint" style="margin-top:14px; color:var(--warning);">Mark <strong>'+sel.rows.length+' claimant'+(sel.rows.length===1?'':'s')+'</strong> ('+fmtMoney(sel.total)+' in total) as reimbursed and email '+(sel.rows.length===1?'them':'each of them')+' now? The email cannot be recalled and these rows cannot be un-ticked afterwards. '+
+          '<button class="btn btn-sm btn-primary" data-action="reimb-update-confirm" '+(STATE.reimbursementBusy?'disabled':'')+'>'+(STATE.reimbursementBusy?'Updating...':'Yes, update & email')+'</button> '+
+          '<button class="btn btn-sm" data-action="reimb-update-cancel" '+(STATE.reimbursementBusy?'disabled':'')+'>Cancel</button></div>';
+      } else {
+        actionBar = '<div style="margin-top:14px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">'+
+          '<button class="btn btn-primary" data-action="reimb-update-start" '+(sel.rows.length?'':'disabled')+'>Update</button>'+
+          '<span class="tiny muted">'+(sel.rows.length ? (sel.rows.length+' selected - '+fmtMoney(sel.total)) : 'Tick the claimants you have reimbursed, then press Update.')+'</span>'+
+        '</div>';
+      }
+    }
+
+    return '<div class="card">'+
+      '<div class="card-title">Reimbursement</div>'+intro+
+      '<div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">'+
+        '<label class="tiny muted">Reimbursement date <select data-action="set-reimbursement-cycle" style="max-width:100%;">'+cycleOptions+'</select></label>'+
+        dueNote+
+      '</div>'+
+      (pendingInBatch ? '<div class="field-hint" style="margin-bottom:10px;">'+pendingInBatch+' claim'+(pendingInBatch===1?'':'s')+' submitted for this batch '+(pendingInBatch===1?'is':'are')+' still awaiting approval and will appear here once approved.</div>' : '')+
+      '<div class="table-wrap"><table class="data-table">'+
+        '<thead><tr><th>Claimant</th><th>Mobile Number</th><th>No. of Claims</th><th>Submitted</th><th>Claim Amount</th>'+
+          '<th>Reimbursed '+(rowsInfo.todo.length ? '<label class="tiny muted" style="text-transform:none; letter-spacing:0; font-weight:400; cursor:pointer;"><input type="checkbox" data-action="reimb-select-all" '+(allTicked?'checked':'')+'/> all</label>' : '')+'</th></tr></thead>'+
+        '<tbody>'+todoHtml+doneHtml+'</tbody>'+
+        (rowsInfo.todo.length ? '<tfoot><tr><td colspan="2"><strong>To reimburse</strong></td><td><strong>'+todoClaims+'</strong></td><td></td><td><strong>'+fmtMoney(todoTotal)+'</strong></td><td></td></tr></tfoot>' : '')+
+      '</table></div>'+
+      (rowsInfo.todo.length ? '' : '<div class="field-hint" style="margin-top:12px;">Everyone in this batch has been reimbursed.</div>')+
+      actionBar+
+    '</div>';
+  }
+
+  // Marks the ticked claimants' approved claims in the shown batch as
+  // reimbursed. The database function does the marking AND sends each
+  // claimant one email (plus an in-app notification), so this can't drift
+  // out of step with what the person is told.
+  function runReimbursementUpdate(){
+    var byDate = approvedClaimsByPayoutDate();
+    var cycle = reimbursementSelectedCycle(byDate);
+    if(!cycle) return Promise.resolve();
+    var sel = reimbursementSelection(reimbursementRowsFor(byDate[cycle]).todo);
+    if(!sel.claimIds.length){ STATE.reimbursementConfirming = false; render(); return Promise.resolve(); }
+    STATE.reimbursementBusy = true; STATE.reimbursementCycle = cycle; render();
+    return supabase.rpc('mark_claims_reimbursed', {p_claim_ids: sel.claimIds}).then(function(res){
+      if(res.error){
+        STATE.reimbursementBusy = false; STATE.reimbursementConfirming = false;
+        var m = res.error.message || String(res.error);
+        showToast(/mark_claims_reimbursed/.test(m) && /not exist|find the function|schema cache/i.test(m) ? 'Run database migration 017 in Supabase first.' : ('Could not update: '+m), 'error');
+        render();
+        return;
+      }
+      var out = res.data || {};
+      STATE.reimbursementChecked = {}; STATE.reimbursementConfirming = false; STATE.reimbursementBusy = false;
+      showToast((out.people_notified||0)+' claimant'+((out.people_notified||0)===1?'':'s')+' marked reimbursed and notified.', 'success');
+      return loadAppData().then(function(){ render(); });
+    });
   }
 
   function renderAdminInvoiceHistory(){
@@ -3901,7 +4192,7 @@
     }
     return supabase.from('profiles').update({role:role}).eq('id', id).then(function(res){
       if(res.error){ showToast('Could not update role: '+res.error.message, 'error'); return; }
-      showToast('Role updated.', 'success');
+      showToast(role==='admin' ? 'Role updated. New administrators start without User Access and Reimbursement - use Manage to grant more.' : 'Role updated.', 'success');
       return loadAppData();
     }).then(function(){ render(); });
   }
@@ -4081,8 +4372,6 @@
       // land on Annual Invoice instead.
       case 'goto-newhire-invoicing': STATE.activeTab='finance'; STATE.financeSubTab='newhire'; render(); return Promise.resolve();
       case 'goto-annual-invoice': STATE.activeTab='finance'; STATE.financeSubTab='annual'; render(); return Promise.resolve();
-      // Jumps to Invoice History from the action banner's "awaiting payment" chip.
-      case 'goto-invoice-history': STATE.activeTab='finance'; STATE.financeSubTab='history'; render(); return Promise.resolve();
       case 'logout': return supabase.auth.signOut();
       case 'buy-pa': window.open('https://insure.aia.com.sg/aianow3/solitaire?f=43519&i=agy', '_blank', 'noopener,noreferrer'); return Promise.resolve();
       case 'buy-travel-insurance': window.open('https://sg-customer.qbe.com/travel/partner/01000960', '_blank', 'noopener,noreferrer'); return Promise.resolve();
@@ -4175,6 +4464,13 @@
       case 'confirm-promotion': return confirmPromotion(id);
       case 'cancel-promotion': cancelPromotion(); return Promise.resolve();
       case 'finance-subtab': STATE.financeSubTab = btn.dataset.subtab; render(); return Promise.resolve();
+      case 'edit-admin-settings': openAdminSettings(btn.dataset.id); return Promise.resolve();
+      case 'cancel-admin-settings': STATE.adminSettingsDraft = null; render(); return Promise.resolve();
+      case 'save-admin-settings': return saveAdminSettings();
+      case 'toggle-reimb-detail': { var rk = btn.dataset.key; if(STATE.reimbursementExpanded[rk]) delete STATE.reimbursementExpanded[rk]; else STATE.reimbursementExpanded[rk] = true; render(); return Promise.resolve(); }
+      case 'reimb-update-start': STATE.reimbursementConfirming = true; render(); return Promise.resolve();
+      case 'reimb-update-cancel': STATE.reimbursementConfirming = false; render(); return Promise.resolve();
+      case 'reimb-update-confirm': return runReimbursementUpdate();
 
       /* ---- Annual Invoice: Preview / Issue / Download / waivers ---- */
       case 'preview-annual-invoice': {
@@ -4296,6 +4592,24 @@
       case 'reject-reason-select': toggleOtherReasonField(target); return Promise.resolve();
       case 'set-report-month': STATE.reportMonth = parseInt(target.value,10); render(); return Promise.resolve();
       case 'set-report-year': STATE.reportYear = (target.value==='ytd') ? 'ytd' : parseInt(target.value,10); render(); return Promise.resolve();
+      case 'admin-full-access': {
+        var dfa = STATE.adminSettingsDraft; if(dfa){ dfa.full = target.checked; if(!target.checked){ ADMIN_MODULES.forEach(function(m){ dfa.modules[m.key] = true; }); } }
+        render(); return Promise.resolve();
+      }
+      case 'admin-module-toggle': { if(STATE.adminSettingsDraft){ STATE.adminSettingsDraft.modules[target.dataset.module] = target.checked; } render(); return Promise.resolve(); }
+      case 'admin-notify-digest': { if(STATE.adminSettingsDraft){ STATE.adminSettingsDraft.digest = target.checked; } render(); return Promise.resolve(); }
+      case 'admin-notify-reminder': { if(STATE.adminSettingsDraft){ STATE.adminSettingsDraft.reminder = target.checked; } render(); return Promise.resolve(); }
+      case 'set-reimbursement-cycle': STATE.reimbursementCycle = target.value; STATE.reimbursementChecked = {}; STATE.reimbursementConfirming = false; render(); return Promise.resolve();
+      case 'toggle-reimb-emp': {
+        if(target.checked) STATE.reimbursementChecked[target.dataset.empId] = true; else delete STATE.reimbursementChecked[target.dataset.empId];
+        STATE.reimbursementConfirming = false; render(); return Promise.resolve();
+      }
+      case 'reimb-select-all': {
+        var rbd = approvedClaimsByPayoutDate(); var rcy = reimbursementSelectedCycle(rbd);
+        STATE.reimbursementChecked = {};
+        if(target.checked && rcy){ reimbursementRowsFor(rbd[rcy]).todo.forEach(function(r){ STATE.reimbursementChecked[r.empId] = true; }); }
+        STATE.reimbursementConfirming = false; render(); return Promise.resolve();
+      }
       case 'set-invoice-year': STATE.invoiceYear = parseInt(target.value,10); STATE.annualWaivers = {}; STATE.editingWaiverLine = null; render(); return Promise.resolve();
       case 'toggle-entitlement-check': { var selC = getEntitlementSelection(target.dataset.key); selC.checked = target.checked; render(); return Promise.resolve(); }
       case 'toggle-entitlement-prorate': { var selP = getEntitlementSelection(target.dataset.key); selP.prorate = target.checked; selP.prorateManual = true; render(); return Promise.resolve(); }
