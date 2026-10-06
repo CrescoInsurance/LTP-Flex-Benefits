@@ -198,6 +198,8 @@
   .claim-detail-table tr.total-row td{border-top:1px solid var(--border);font-weight:700;padding-top:6px;}
   .pdf-detail-check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-muted);}
   .pdf-detail-check input{width:15px;height:15px;}
+  .reimb-done-row td{opacity:.7;}
+  .data-table tfoot td{border-top:2px solid var(--border);border-bottom:none;padding-top:9px;}
 
   /* ---------- Status pills ---------- */
   .status-pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:capitalize;}
@@ -302,3 +304,8 @@
   /* A .field-hint left with no text (nothing to show) no longer renders as
      an empty coloured box. */
   .field-hint:empty{display:none;}
+  .status-reimbursed{background:#dff0f7;color:#12607f;}
+  .status-reimbursed-date{color:#12607f;}
+  .admin-settings-panel{padding:12px 14px;background:var(--bg);border-radius:8px;}
+  .admin-module-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 18px;margin:8px 0 12px;}
+  .admin-check{display:flex;gap:6px;align-items:center;font-size:12.5px;cursor:pointer;margin-bottom:4px;}
